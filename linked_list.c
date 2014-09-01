@@ -69,8 +69,10 @@ void addToTailList(struct linkedList *linkedList, struct linkedNode *node) {
             linkedList->tail = node;
         }
         linkedList->size++;
-        if (pthread_cond_signal((&linkedList->cond))) {
-            fprintf(stderr, "Error signalling condition variable.\n");
+        if (linkedList->doSignal) {
+            if (pthread_cond_signal((&linkedList->cond))) {
+                fprintf(stderr, "Error signalling condition variable.\n");
+            }
         }
         if (pthread_mutex_unlock(&(linkedList->mutex))) {
             fprintf(stderr, "Error releasing list mutex.\n");

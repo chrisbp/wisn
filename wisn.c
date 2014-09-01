@@ -16,15 +16,20 @@ pcap_t *pcapHandle;             //Pcap handle for the wifi interface to listen o
 volatile char isPcapOpen;       //Flag to indicate whether pcap handle is open or closed
 
 pthread_t channelThread;        //Thread for channel switcher
-pthread_t commsThread;          //Thread for sending data to server
+pthread_t commsThread;          //Thread for communicating with MQTT broker
+volatile char isChannelThreadRunning;   //Flag for if channels switcher is running
 
 struct linkedList packetList;   //Linked list to queue up packets received over wifi
+khash_t(pckM) *packetMap;       //Hashmap for recently received packets
 
-khash_t(pckM) *packetMap;    //Hashmap for recently received packets
-
-int sockFD; //File descriptor for connection to server
+MQTTAsync MQTTClient;           //MQTT client
+volatile char isMQTTCreated;    //Flag for if MQTTClient has been initialised
+volatile char isMQTTConnected;  //Flag for if connected to MQTT broker
+char MQTTTopic[16];             //Topic for publishing messages
+char *MQTTAddress;              //Address of MQTT broker
 
 int main(int argc, char *argv[]) {
+    unsigned char size;
     //Signal handler for kill/termination
     struct sigaction sa;
     pthread_attr_t attr;
@@ -35,18 +40,23 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Invalid base number.\n");
             exit(2);
         }
+        memset(MQTTTopic, 0, ARRAY_SIZE(MQTTTopic));
+        snprintf(MQTTTopic, ARRAY_SIZE(MQTTTopic), "wisn/wisn%03u", baseNum);
+
         if (checkInterface(argv[2]) == 0) {
             fprintf(stderr, "No network interface with name %s found.\n", argv[2]);
             exit(5);
         } else {
-            unsigned char size = sizeof(char) * (strlen(argv[2]) + 1);
-            wifiInterface = calloc(1, size);
+            size = sizeof(char) * (strlen(argv[2]) + 1);
+            wifiInterface = (char *)calloc(1, size);
             memcpy(wifiInterface, argv[2], size);
         }
-        if (connectToServer(argv[3])) {
-            close(sockFD);
-            exit(6);
-        }
+        isMQTTConnected = 0;
+        isMQTTCreated = 0;
+        connectToBroker(&MQTTClient, argv[3], baseNum);
+        size = sizeof(char) * (strlen(argv[3]) + 1);
+        MQTTAddress = (char *)malloc(size);
+        strncpy(MQTTAddress, argv[3], size);
     } else {
         fprintf(stderr, usage);
         exit(1);
@@ -58,6 +68,7 @@ int main(int argc, char *argv[]) {
     sigaction(SIGTERM, &sa, 0);
 
     isPcapOpen = 0;
+    isChannelThreadRunning = 0;
     initList(&packetList);
 
     packetMap = kh_init(pckM);
@@ -68,15 +79,16 @@ int main(int argc, char *argv[]) {
     pcapHandle = initialisePcap("wlan0");
 
     if (pcapHandle == NULL) {
-        exit(6);
+        cleanup(6);
     }
 
     //Start channel switcher thread
     //changeChannel(13);
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
-    pthread_create(&commsThread, &attr, sendToServer, NULL);
     pthread_create(&channelThread, &attr, channelSwitcher, NULL);
+    pthread_create(&commsThread, &attr, sendToServer, NULL);
+    isChannelThreadRunning  = 1;
     pthread_attr_destroy(&attr);
 
     printf("Finished initialisation.\n");
@@ -84,7 +96,7 @@ int main(int argc, char *argv[]) {
     pcap_loop(pcapHandle, -1, readPacket, NULL);
 
     //Should never reach here but just incase...
-    cleanup();
+    cleanup(-1);
 }
 
 /*int runCommand(char *command, char **args) {
@@ -135,15 +147,33 @@ int runCommand(const char *command, char *arg) {
 
 /* Cleanup function called before exit.
  */
-void cleanup() {
+void cleanup(int ret) {
+    void *status;
     closePcap(pcapHandle);
-    //try send any unsent messages here
-    //then disconnect
-    //then destroy MQTT client
+    signalList(&packetList);
+    if (isChannelThreadRunning) {
+        pthread_cancel(channelThread);
+        pthread_join(channelThread, &status);
+        isChannelThreadRunning = 0;
+    }
+    pthread_join(commsThread, &status);
+    if (isMQTTConnected) {
+        isMQTTConnected = 0;
+        int ret;
+        MQTTAsync_disconnectOptions dcOpts = MQTTAsync_disconnectOptions_initializer;
+        ret = MQTTAsync_disconnect(MQTTClient, &dcOpts);
+        if (ret != MQTTASYNC_SUCCESS) {
+            fprintf(stderr, "Error disconnecting from MQTT broker.\n");
+        }
+    }
+    if (isMQTTCreated) {
+        isMQTTCreated = 0;
+        MQTTAsync_destroy(&MQTTClient);
+    }
     destroyList(&packetList, PACKET);
     kh_destroy(pckM, packetMap);
     free(wifiInterface);
-    exit(0);
+    exit(ret);
 }
 
 /* Initialises the wifi interface and pcap handle.
@@ -198,20 +228,14 @@ pcap_t* initialisePcap(char *device) {
     return pcapHandle;
 }
 
-/* Closes the open pcap handle and waits on the channel switcher thread to exit.
+/* Closes the open pcap handle.
  */
 void closePcap(pcap_t *pcapHandle) {
-    void *status;
     isPcapOpen = 0;
     if (pcapHandle != NULL) {
         pcap_breakloop(pcapHandle);
         pcap_close(pcapHandle);
     }
-    signalList(&packetList);
-    pthread_join(channelThread, &status);
-    pthread_join(commsThread, &status);
-    close(sockFD);
-    pthread_exit(NULL);
 }
 
 /*void copyMAC(unsigned long long *dest, unsigned char *src) {
@@ -275,6 +299,7 @@ void readPacket(u_char *args, const struct pcap_pkthdr *header, const u_char *pa
         memcpy(wisnData->mac, addr, ARRAY_SIZE(wisnData->mac));
         wisnData->baseNum = baseNum;
         wisnData->rssi = 0;
+        channel = 0;
 
         //Check for 
         //if (radiotapHeader->it_present & 0x810) {
@@ -427,7 +452,7 @@ char checkInterface(char *interface) {
 /* Attempts to connect to the server at the given address.
  * Returns zero upon successful connection; otherwise non-zero.
  */
-int connectToServer(char *serverAddress) {
+/*int connectToServer(char *serverAddress) {
     int status;
     struct addrinfo hints;
     struct addrinfo *results;
@@ -468,11 +493,11 @@ int connectToServer(char *serverAddress) {
     }
 
     return status;
-}
+}*/
 
 /* Thread for sending all received wifi packets to the server.
  */
-void *sendToServer(void *arg) {
+/*void *sendToServer(void *arg) {
     unsigned char *buffer;
     unsigned int size;
     while (!pthread_mutex_lock(&(packetList.mutex))) {
@@ -503,7 +528,7 @@ void *sendToServer(void *arg) {
     }
 
     pthread_exit(NULL);
-}
+}*/
 
 /* Converts the data from a wisnPacket struct in a serialised form.
  * Returns a pointer to a buffer containing the serialised data.
@@ -543,14 +568,132 @@ void signalList(struct linkedList *list) {
     }
 }
 
-/*void connectToBroker(MQTTAsync *mqttClient, MQTTAsync_connectOptions *conn_opts,
-        char *address, char * clientId) {
-    MQTTAsync_create(mqttClient, address, clientId, MQTTCLIENT_PERSISTENCE_NONE, NULL);
-    MQTTAsync_setCallbacks(*mqttClient, NULL, connectionLost, NULL, NULL);
-    conn_opts->cleansession = 1;
-    conn_opts->onFailure = ;
-    
-    if (MQTTAsync_connect(*mqttClient, conn_opts) != MQTTASYNC_SUCCESS) {
-        fprintf(stderr, "Failed to connect to broker: %s\n", address);
+/* Attempts to connect to the given MQTT broker.
+ */
+unsigned int connectToBroker(MQTTAsync *mqttClient, char *address, unsigned int baseNum) {
+    char clientID[24];
+    char MQTTAddress[256];
+    unsigned int res = 255;
+    MQTTAsync_connectOptions conn_opts = MQTTAsync_connectOptions_initializer;
+
+    memset(clientID, 0, ARRAY_SIZE(clientID));
+    snprintf(clientID, ARRAY_SIZE(clientID), "wisn%03u", baseNum);
+
+    memset(MQTTAddress, 0, ARRAY_SIZE(MQTTAddress));
+    snprintf(MQTTAddress, ARRAY_SIZE(MQTTAddress), "tcp://%s", address);
+
+    if (!isMQTTCreated) {
+        MQTTAsync_create(mqttClient, address, clientID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+        isMQTTCreated = 1;
     }
-}*/
+    MQTTAsync_setCallbacks(*mqttClient, NULL, connectionLost, NULL, NULL);
+    conn_opts.cleansession = 1;
+    conn_opts.onFailure = connectFailed;
+    
+    res = MQTTAsync_connect(*mqttClient, &conn_opts);
+
+    if (res == 1) { //Connection refused: Unacceptable protocol version
+        fprintf(stderr, "Connection to %s refused: Unacceptable protocol version.\n", address);
+    } else if (res == 2) {  //Connection refused: Identifier rejected
+        fprintf(stderr, "Connection to %s refused: Identifier rejected.\n", address);
+    } else if (res == 3) {  //Connection refused: Server unavailable
+        fprintf(stderr, "Connection to %s refused: Server unavailable.\n", address);
+    } else if (res == 4) {  //Connection refused: Bad user name or password
+        fprintf(stderr, "Connection to %s refused: Bad user name or password.\n", address);
+    } else if (res == 5) {  //Connection refused: Not authorized
+        fprintf(stderr, "Connection to %s refused: Not authorized.\n", address);
+    } else if (res == MQTTASYNC_SUCCESS) {
+        isMQTTConnected = 1;
+        packetList.doSignal = 1;
+    } else {    //Unknown error
+        fprintf(stderr, "Unknown error connecting to %s.\n", address);
+    }
+
+    return res;
+}
+
+/* Handler called when connection to the MQTT broker is lost.
+ */
+void connectionLost(void *context, char *cause) {
+    packetList.doSignal = 0;
+    isMQTTConnected = 0;
+    fprintf(stderr, "Lost connection to MQTT broker: %s.\nAttempting reconnection...\n",
+                MQTTAddress);
+    connectToBroker(&MQTTClient, MQTTAddress, baseNum);
+}
+
+/* Handler called when an attempt to connect to the MQTT broker fails.
+ */
+void connectFailed(void *context, MQTTAsync_failureData *response) {
+    unsigned char num;
+    struct timespec sleepTime;
+    sleepTime.tv_sec = 1;
+    sleepTime.tv_nsec = 0;
+
+    packetList.doSignal = 0;
+    isMQTTConnected = 0;
+
+    fprintf(stderr, "Failed to connect to MQTT broker: %s.\nAttempting reconnection in 30 seconds.\n",
+            MQTTAddress);
+
+    num = 0;
+    while (isMQTTCreated && num < 30) {
+        nanosleep(&sleepTime, NULL);
+        if (!isMQTTCreated) {
+            return;
+        }
+        num++;
+    }
+    connectToBroker(&MQTTClient, MQTTAddress, baseNum);
+}
+
+/* Thread for sending all received wifi packets to the server.
+ */
+void *sendToServer(void *arg) {
+    char buffer[128];
+    int ret;
+    MQTTAsync_responseOptions rOpts = MQTTAsync_responseOptions_initializer;
+    MQTTAsync_message message = MQTTAsync_message_initializer;
+
+    while (pthread_mutex_lock(&(packetList.mutex))) {
+        fprintf(stderr, "Error acquiring list mutex.\n");
+    }
+
+    while (isPcapOpen) {
+        while (packetList.head == NULL && isPcapOpen) {
+            if (pthread_cond_wait(&(packetList.cond), &(packetList.mutex))) {
+                fprintf(stderr, "Error waiting for condition variable signal\n");
+            }
+        }
+
+        if (!isPcapOpen) {
+            break;
+        }
+
+        JSONisePacket(packetList.head->data.pdata, buffer, ARRAY_SIZE(buffer));
+        message.payload = buffer;
+        message.payloadlen = strlen(buffer);
+        ret = MQTTAsync_sendMessage(MQTTClient, MQTTTopic, &message, &rOpts);
+        if (ret != MQTTASYNC_SUCCESS) {
+            //fprintf(stderr, "Error sending message.\n");
+        } else {
+            removeFromHeadList(&packetList, 1, PACKET);
+        }
+    }
+
+    if (pthread_mutex_unlock(&(packetList.mutex))) {
+        fprintf(stderr, "Error releasing list mutex.\n");
+    }
+
+    pthread_exit(NULL);
+}
+
+/* Turns the given packet into a JSON structure.
+ */
+void JSONisePacket(struct wisnPacket *packet, char *buffer, int size) {
+    memset(buffer, 0, size);
+
+    snprintf(buffer, size, "{\"time\":%llu,\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"rssi\":%d}",
+            packet->timestamp, packet->mac[0], packet->mac[1], packet->mac[2], packet->mac[3], packet->mac[4],
+            packet->mac[5], packet->rssi);
+}

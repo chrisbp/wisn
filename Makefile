@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -pedantic --std=gnu99 -lpcap -pthread -O1
+CFLAGS = -Wall -pedantic --std=gnu99 -lpcap -lpaho-mqtt3a -pthread -O1
 
 .PHONY: all clean
 

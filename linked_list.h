@@ -16,6 +16,7 @@ struct linkedList {
     unsigned int size;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
+    char doSignal;
 };
 
 //Struct for linked list nodes
