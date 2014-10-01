@@ -8,9 +8,9 @@ const char *ifconfigDownCommand = "ifconfig %s down";           //Command to bri
 const char *ifconfigUpCommand = "ifconfig %s up";               //Command to bring up a network interface
 const char *iwconfigChannelCommand = "iwconfig %s channel %d";  //Command to change wifi channel
 
-unsigned int baseNum;   //Number of this base node
+unsigned int nodeNum;   //Number of this base node
 char *wifiInterface;    //Name of wifi interface
-const char *usage = "Usage: wisn base_num wifi_interface server_address\n"; //Usage string
+const char *usage = "Usage: wisn node_num wifi_interface mqtt_address [mqtt_port]\n"; //Usage string
 
 pcap_t *pcapHandle;             //Pcap handle for the wifi interface to listen on
 volatile char isPcapOpen;       //Flag to indicate whether pcap handle is open or closed
@@ -22,11 +22,16 @@ volatile char isChannelThreadRunning;   //Flag for if channels switcher is runni
 struct linkedList packetList;   //Linked list to queue up packets received over wifi
 khash_t(pckM) *packetMap;       //Hashmap for recently received packets
 
-MQTTAsync MQTTClient;           //MQTT client
+#ifdef DISTANCE
+int movAvg[32];
+int movAvgSize = 0;
+#endif
+
+struct mosquitto *mosqConn;     //MQTT connection handle
+int mqttPort;                   //MQTT broker port to connect on - default is 1883
 volatile char isMQTTCreated;    //Flag for if MQTTClient has been initialised
 volatile char isMQTTConnected;  //Flag for if connected to MQTT broker
 char MQTTTopic[16];             //Topic for publishing messages
-char *MQTTAddress;              //Address of MQTT broker
 
 int main(int argc, char *argv[]) {
     unsigned char size;
@@ -34,14 +39,14 @@ int main(int argc, char *argv[]) {
     struct sigaction sa;
     pthread_attr_t attr;
 
-    if (argc == 4) {
-        baseNum = strtoul(argv[1], NULL, 10);
-        if (baseNum < 1) {
+    if (argc > 4) {
+        nodeNum = strtoul(argv[1], NULL, 10);
+        if (nodeNum < 1) {
             fprintf(stderr, "Invalid base number.\n");
             exit(2);
         }
         memset(MQTTTopic, 0, ARRAY_SIZE(MQTTTopic));
-        snprintf(MQTTTopic, ARRAY_SIZE(MQTTTopic), "wisn/wisn%03u", baseNum);
+        snprintf(MQTTTopic, ARRAY_SIZE(MQTTTopic), "wisn/wisn%03u", nodeNum);
 
         if (checkInterface(argv[2]) == 0) {
             fprintf(stderr, "No network interface with name %s found.\n", argv[2]);
@@ -51,12 +56,20 @@ int main(int argc, char *argv[]) {
             wifiInterface = (char *)calloc(1, size);
             memcpy(wifiInterface, argv[2], size);
         }
+        if (argc > 4) {
+            mqttPort = strtoul(argv[4], NULL, 10);
+            if (mqttPort < 1 || mqttPort > 65535) {
+                fprintf(stderr, "Invalid port\n");
+                fprintf(stderr, usage);
+                exit(2);
+            }
+        } else {
+            mqttPort = MQTTPORT;
+        }
+
         isMQTTConnected = 0;
         isMQTTCreated = 0;
-        connectToBroker(&MQTTClient, argv[3], baseNum);
-        size = sizeof(char) * (strlen(argv[3]) + 1);
-        MQTTAddress = (char *)malloc(size);
-        strncpy(MQTTAddress, argv[3], size);
+        connectToBroker(argv[3], nodeNum, mqttPort);
     } else {
         fprintf(stderr, usage);
         exit(1);
@@ -83,7 +96,6 @@ int main(int argc, char *argv[]) {
     }
 
     //Start channel switcher thread
-    //changeChannel(13);
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
     pthread_create(&channelThread, &attr, channelSwitcher, NULL);
@@ -100,23 +112,23 @@ int main(int argc, char *argv[]) {
 }
 
 /*int runCommand(char *command, char **args) {
-    pid_t pid = vfork();
-    int retval = -1;
-    if (pid) {  //parent
-        int status;
-        if (waitpid(pid, &status, 0) == -1) {
-            //error
-            printf("Error occurred waiting for child.");
-        }
-        if (WIFEXITED(status)) {
-            retval = WEXITSTATUS(status);
-        }
-    } else {    //child
-        if (execvp(command, args) == -1) {
-            exit(99);
-        }
-    }
-    return retval;
+  pid_t pid = vfork();
+  int retval = -1;
+  if (pid) {  //parent
+  int status;
+  if (waitpid(pid, &status, 0) == -1) {
+//error
+printf("Error occurred waiting for child.");
+}
+if (WIFEXITED(status)) {
+retval = WEXITSTATUS(status);
+}
+} else {    //child
+if (execvp(command, args) == -1) {
+exit(99);
+}
+}
+return retval;
 }*/
 
 /* Runs a given command and a single argument.
@@ -159,18 +171,15 @@ void cleanup(int ret) {
     pthread_join(commsThread, &status);
     if (isMQTTConnected) {
         isMQTTConnected = 0;
-        int ret;
-        MQTTAsync_disconnectOptions dcOpts = MQTTAsync_disconnectOptions_initializer;
-        ret = MQTTAsync_disconnect(MQTTClient, &dcOpts);
-        if (ret != MQTTASYNC_SUCCESS) {
-            fprintf(stderr, "Error disconnecting from MQTT broker.\n");
-        }
+        mosquitto_disconnect(mosqConn);
+        mosquitto_loop_stop(mosqConn, 0);
     }
     if (isMQTTCreated) {
         isMQTTCreated = 0;
-        MQTTAsync_destroy(&MQTTClient);
+        mosquitto_destroy(mosqConn);
+        mosquitto_lib_cleanup();
     }
-    destroyList(&packetList, PACKET);
+    destroyList(&packetList);
     kh_destroy(pckM, packetMap);
     free(wifiInterface);
     exit(ret);
@@ -238,15 +247,33 @@ void closePcap(pcap_t *pcapHandle) {
     }
 }
 
-/*void copyMAC(unsigned long long *dest, unsigned char *src) {
-    *dest = 0;
-    *dest |= *src << 40;
-    *dest |= *(src + 1) << 32;
-    *dest |= *(src + 2) << 24;
-    *dest |= *(src + 3) << 16;
-    *dest |= *(src + 4) << 8;
-    *dest |= *(src + 5);
-}*/
+#ifdef DISTANCE
+double getDistance(double rssi, int type) {
+    double res = 0;
+    if (type == 1) {        //iperf linear
+        res = (0.1994 * rssi) - 1.3107;
+    } else if (type == 2) { //iperf power
+        res = 0.0003 * pow(rssi, 2.9324);
+    } else if (type == 3) { //ping linear
+        res = (0.1551 * rssi) - 1.147;
+    } else if (type == 4) { //ping power
+        res = 0.0005 * pow(rssi, 2.5813);
+    } else if (type == 5) { //mr3040 linear
+        res = (0.1789 * rssi) - 1.4057;
+    } else if (type == 6) { //mr3040 power
+        res = 0.0003 * pow(rssi, 2.8125);
+    } else if (type == 7) { //mr3040setDist linear
+        res = (0.1782 * rssi) - 1.1795;
+    } else if (type == 8) { //mr3040setDist power
+        res = 0.0005 * pow(rssi, 2.7237);
+    } else if (type == 9) { //multiphone linear
+        res = (0.1637 * rssi) - 1.0448;
+    } else if (type == 10) { //multiphone power
+        res = 0.0002 * pow(rssi, 2.9179);
+    }
+    return res;
+}
+#endif
 
 /* Callback function for pcap loop. Is called every time a packet is received.
  */
@@ -266,25 +293,22 @@ void readPacket(u_char *args, const struct pcap_pkthdr *header, const u_char *pa
     if (get802Type(ieee80211Header) != IEEE80211_MANAGEMENT || get802Subtype(ieee80211Header) != 8) {
         int ret;
         unsigned char *addr;
-        ///
         char buff[16];
         struct tm *tmInfo;
-        ///
         time_t now = time(NULL);
         unsigned long long mac = 0;
-        if (get802Type(ieee80211Header) == IEEE80211_CONTROL && (get802Subtype(ieee80211Header) == 12 ||
-            get802Subtype(ieee80211Header) == 13)) {
-            addr = ieee80211Header->address1;
-        } else {
-            addr = ieee80211Header->address2;
-        }
+        /*if (get802Type(ieee80211Header) == IEEE80211_CONTROL && (get802Subtype(ieee80211Header) == 12 ||
+          get802Subtype(ieee80211Header) == 13)) {
+          addr = ieee80211Header->address1;
+          } else {*/
+        addr = ieee80211Header->address2;
+        //}
 
         memcpy(&mac, addr, ARRAY_SIZE(ieee80211Header->address2));
-//        copyMAC(&mac, ieee80211Header->address2);
 
         khint_t it = kh_get(pckM, packetMap, mac);
         if (it != kh_end(packetMap)) {
-            if (now - kh_value(packetMap, it) < 10) {
+            if (now - kh_value(packetMap, it) < 2) {
                 return;
             } else {
                 kh_value(packetMap, it) = now;
@@ -297,7 +321,7 @@ void readPacket(u_char *args, const struct pcap_pkthdr *header, const u_char *pa
         wisnData = (struct wisnPacket *)malloc(sizeof(*wisnData));
         wisnData->timestamp = (unsigned long long)now;
         memcpy(wisnData->mac, addr, ARRAY_SIZE(wisnData->mac));
-        wisnData->baseNum = baseNum;
+        wisnData->nodeNum = nodeNum;
         wisnData->rssi = 0;
         channel = 0;
 
@@ -329,6 +353,33 @@ void readPacket(u_char *args, const struct pcap_pkthdr *header, const u_char *pa
                 ieee80211Header->address1[3], ieee80211Header->address1[4], ieee80211Header->address1[5],
                 wisnData->mac[0], wisnData->mac[1], wisnData->mac[2], wisnData->mac[3], wisnData->mac[4],
                 wisnData->mac[5], wisnData->rssi);
+        #ifdef DISTANCE
+        double avg = 0;
+        movAvg[movAvgSize] = wisnData->rssi;
+        movAvgSize++;
+        if (movAvgSize == 1) {
+            avg = wisnData->rssi;
+        } else {
+            while (movAvgSize > 16) {
+                for (int i = 1; i < movAvgSize; i++) {
+                    movAvg[i - 1] = movAvg[i];
+                }
+                movAvg[movAvgSize - 1] = 0;
+                movAvgSize--;
+            }
+            for (int i = 0; i < movAvgSize; i++) {
+                avg += movAvg[i];
+            }
+            avg /= movAvgSize;
+        }
+        fprintf(stdout, "%f\n", avg);
+        //        fprintf(stdout, "distance 1: %f m, 2: %f m\n", getDistance(avg, 1), getDistance(avg, 2));
+        //        fprintf(stdout, "distance 3: %f m, 4: %f m\n", getDistance(avg, 3), getDistance(avg, 4));
+        //        fprintf(stdout, "distance 5: %f m, 6: %f m\n", getDistance(avg, 5), getDistance(avg, 6));
+        //        fprintf(stdout, "distance 7: %f m, 8: %f m\n", getDistance(avg, 7), getDistance(avg, 8));
+        fprintf(stdout, "distance 6: %f m, distance 9: %f m, 10: %f m\n", getDistance(avg, 6), getDistance(avg, 9), getDistance(avg, 10));
+        #endif
+
         addPacketToTailList(&packetList, wisnData);
     }
 }
@@ -352,37 +403,15 @@ void changeChannel(char channel) {
  * Returns the wifi channel between 1 and 14; otherwise -1 for non-matching frequencies/
  */
 char getChannel(short frequency) {
-    if (frequency == 2412) {
-        return 1;
-    } else if (frequency == 2417) {
-        return 2;
-    } else if (frequency == 2422) {
-        return 3;
-    } else if (frequency == 2427) {
-        return 4;
-    } else if (frequency == 2432) {
-        return 5;
-    } else if (frequency == 2437) {
-        return 6;
-    } else if (frequency == 2442) {
-        return 7;
-    } else if (frequency == 2447) {
-        return 8;
-    } else if (frequency == 2452) {
-        return 9;
-    } else if (frequency == 2457) {
-        return 10;
-    } else if (frequency == 2462) {
-        return 11;
-    } else if (frequency == 2467) {
-        return 12;
-    } else if (frequency == 2472) {
-        return 13;
-    } else if (frequency == 2484) {
+    if (frequency == 2484) {
         return 14;
-    } else {
-        return -1;
     }
+
+    if (frequency < 2484) {
+        return (frequency - 2407) / 5;
+    }
+
+    return -1;
 }
 
 /* Thread responsible for switching wifi channels periodically.
@@ -397,6 +426,8 @@ void *channelSwitcher(void *arg) {
     sleepTime.tv_sec = 30;
     //sleepTime.tv_nsec = 500000000L;
     sleepTime.tv_nsec = 0;
+
+    changeChannel(1);
 
     while (isPcapOpen) {
         changeChannel(currentChannel);
@@ -449,116 +480,35 @@ char checkInterface(char *interface) {
     return match;
 }
 
-/* Attempts to connect to the server at the given address.
- * Returns zero upon successful connection; otherwise non-zero.
- */
-/*int connectToServer(char *serverAddress) {
-    int status;
-    struct addrinfo hints;
-    struct addrinfo *results;
-    struct addrinfo *r;
-
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-
-    status = getaddrinfo(serverAddress, PORT, &hints, &results);
-    if (status) {
-        fprintf(stderr, "Error getting server address info.\n");
-        return status;
-    }
-
-    for (r = results; r != NULL; r = r->ai_next) {
-        if (r->ai_family == AF_INET) {
-            sockFD = socket(r->ai_family, r->ai_socktype, r->ai_protocol);
-            if (sockFD < 0) {
-                fprintf(stderr, "Error creating socket\n");
-                freeaddrinfo(results);
-                return -1;
-            }
-            status = connect(sockFD, r->ai_addr, r->ai_addrlen);
-            if (status) {
-                close(sockFD);
-                fprintf(stderr, "Error connecting to server\n");
-                continue;
-            } else {
-                break;
-            }
-        }
-    }
-    freeaddrinfo(results);
-
-    if (status) {
-        fprintf(stderr, "Error initiating connection...exiting\n");
-    }
-
-    return status;
-}*/
-
-/* Thread for sending all received wifi packets to the server.
- */
-/*void *sendToServer(void *arg) {
-    unsigned char *buffer;
-    unsigned int size;
-    while (!pthread_mutex_lock(&(packetList.mutex))) {
-        fprintf(stderr, "Error acquiring list mutex.\n");
-    }
-
-    while (isPcapOpen) {
-        while (packetList.head == NULL && isPcapOpen) {
-            if (pthread_cond_wait(&(packetList.cond), &(packetList.mutex))) {
-                fprintf(stderr, "Error waiting for condition variable signal\n");
-            }
-        }
-
-        if (!isPcapOpen) {
-            break;
-        }
-        //send here
-        buffer = serialiseWisnPacket(packetList.head->data.pdata, &size);
-        if (send(sockFD, buffer, size, 0) < 0) {
-            fprintf(stderr, "Error sending packet\n");
-        }
-        free(buffer);
-        removeFromHeadList(&packetList, 1, PACKET);
-    }
-
-    if (pthread_mutex_unlock(&(packetList.mutex))) {
-        fprintf(stderr, "Error releasing list mutex.\n");
-    }
-
-    pthread_exit(NULL);
-}*/
-
 /* Converts the data from a wisnPacket struct in a serialised form.
  * Returns a pointer to a buffer containing the serialised data.
  */
-unsigned char *serialiseWisnPacket(struct wisnPacket *packet, unsigned int *size) {
-    unsigned char *buffer;
-    unsigned char *marker;
+/*unsigned char *serialiseWisnPacket(struct wisnPacket *packet, unsigned int *size) {
+  unsigned char *buffer;
+  unsigned char *marker;
 
-    *size = sizeof(packet->timestamp) + ARRAY_SIZE(packet->mac) +
-        sizeof(packet->rssi) + sizeof(packet->baseNum);
+ *size = sizeof(packet->timestamp) + ARRAY_SIZE(packet->mac) +
+ sizeof(packet->rssi) + sizeof(packet->nodeNum);
 
-    buffer = (unsigned char *)malloc(*size);
-    marker = buffer;
+ buffer = (unsigned char *)malloc(*size);
+ marker = buffer;
 
-    packet->timestamp = htobe64(packet->timestamp);
-    memcpy(marker, &(packet->timestamp), sizeof(packet->timestamp));
-    marker += sizeof(packet->timestamp);
+ packet->timestamp = htobe64(packet->timestamp);
+ memcpy(marker, &(packet->timestamp), sizeof(packet->timestamp));
+ marker += sizeof(packet->timestamp);
 
-    memcpy(marker, packet->mac, ARRAY_SIZE(packet->mac));
-    marker += ARRAY_SIZE(packet->mac);
+ memcpy(marker, packet->mac, ARRAY_SIZE(packet->mac));
+ marker += ARRAY_SIZE(packet->mac);
 
-    memcpy(marker, &(packet->rssi), sizeof(packet->rssi));
-    marker += sizeof(packet->rssi);
+ memcpy(marker, &(packet->rssi), sizeof(packet->rssi));
+ marker += sizeof(packet->rssi);
 
-    packet->baseNum = htons(packet->baseNum);
-    memcpy(marker, &(packet->baseNum), sizeof(packet->baseNum));
-    marker += sizeof(packet->baseNum);
+ packet->nodeNum = htons(packet->nodeNum);
+ memcpy(marker, &(packet->nodeNum), sizeof(packet->nodeNum));
+ marker += sizeof(packet->nodeNum);
 
-    return buffer;
-}
+ return buffer;
+ }*/
 
 /* Signals anything waiting on the given list.
  */
@@ -570,90 +520,45 @@ void signalList(struct linkedList *list) {
 
 /* Attempts to connect to the given MQTT broker.
  */
-unsigned int connectToBroker(MQTTAsync *mqttClient, char *address, unsigned int baseNum) {
+unsigned int connectToBroker(char *address, unsigned int nodeNum, int port) {
     char clientID[24];
-    char MQTTAddress[256];
     unsigned int res = 255;
-    MQTTAsync_connectOptions conn_opts = MQTTAsync_connectOptions_initializer;
 
     memset(clientID, 0, ARRAY_SIZE(clientID));
-    snprintf(clientID, ARRAY_SIZE(clientID), "wisn%03u", baseNum);
+    snprintf(clientID, ARRAY_SIZE(clientID), "wisn%03u", nodeNum);
 
-    memset(MQTTAddress, 0, ARRAY_SIZE(MQTTAddress));
-    snprintf(MQTTAddress, ARRAY_SIZE(MQTTAddress), "tcp://%s", address);
-
-    if (!isMQTTCreated) {
-        MQTTAsync_create(mqttClient, address, clientID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
-        isMQTTCreated = 1;
+    mosquitto_lib_init();
+    mosqConn = mosquitto_new(clientID, 1, NULL);
+    if (!mosqConn) {
+        fprintf(stderr, "Error creating connection to MQTT broker.\n");
+        return 1;
     }
-    MQTTAsync_setCallbacks(*mqttClient, NULL, connectionLost, NULL, NULL);
-    conn_opts.cleansession = 1;
-    conn_opts.onFailure = connectFailed;
-    
-    res = MQTTAsync_connect(*mqttClient, &conn_opts);
+    isMQTTCreated = 1;
 
-    if (res == 1) { //Connection refused: Unacceptable protocol version
-        fprintf(stderr, "Connection to %s refused: Unacceptable protocol version.\n", address);
-    } else if (res == 2) {  //Connection refused: Identifier rejected
-        fprintf(stderr, "Connection to %s refused: Identifier rejected.\n", address);
-    } else if (res == 3) {  //Connection refused: Server unavailable
-        fprintf(stderr, "Connection to %s refused: Server unavailable.\n", address);
-    } else if (res == 4) {  //Connection refused: Bad user name or password
-        fprintf(stderr, "Connection to %s refused: Bad user name or password.\n", address);
-    } else if (res == 5) {  //Connection refused: Not authorized
-        fprintf(stderr, "Connection to %s refused: Not authorized.\n", address);
-    } else if (res == MQTTASYNC_SUCCESS) {
-        isMQTTConnected = 1;
-        packetList.doSignal = 1;
-    } else {    //Unknown error
-        fprintf(stderr, "Unknown error connecting to %s.\n", address);
+    res = mosquitto_connect_async(mosqConn, address, port, KEEPALIVE);
+    if (res != MOSQ_ERR_SUCCESS) {
+        fprintf(stderr, "Failed to connect to MQTT broker: %s:%d.\n", address, port);
+        return res;
+    }
+    isMQTTConnected = 1;
+    packetList.doSignal = 1;
+
+    mosquitto_reconnect_delay_set(mosqConn, RECONNECTDELAY, RECONNECTDELAY, 0);
+
+    res = mosquitto_loop_start(mosqConn);
+    if (res != MOSQ_ERR_SUCCESS) {
+        fprintf(stderr, "Failed to start MQTT connection loop.\n");
+        return res;
     }
 
     return res;
 }
 
-/* Handler called when connection to the MQTT broker is lost.
- */
-void connectionLost(void *context, char *cause) {
-    packetList.doSignal = 0;
-    isMQTTConnected = 0;
-    fprintf(stderr, "Lost connection to MQTT broker: %s.\nAttempting reconnection...\n",
-                MQTTAddress);
-    connectToBroker(&MQTTClient, MQTTAddress, baseNum);
-}
-
-/* Handler called when an attempt to connect to the MQTT broker fails.
- */
-void connectFailed(void *context, MQTTAsync_failureData *response) {
-    unsigned char num;
-    struct timespec sleepTime;
-    sleepTime.tv_sec = 1;
-    sleepTime.tv_nsec = 0;
-
-    packetList.doSignal = 0;
-    isMQTTConnected = 0;
-
-    fprintf(stderr, "Failed to connect to MQTT broker: %s.\nAttempting reconnection in 30 seconds.\n",
-            MQTTAddress);
-
-    num = 0;
-    while (isMQTTCreated && num < 30) {
-        nanosleep(&sleepTime, NULL);
-        if (!isMQTTCreated) {
-            return;
-        }
-        num++;
-    }
-    connectToBroker(&MQTTClient, MQTTAddress, baseNum);
-}
-
 /* Thread for sending all received wifi packets to the server.
  */
 void *sendToServer(void *arg) {
-    char buffer[128];
+    char buffer[256];
     int ret;
-    MQTTAsync_responseOptions rOpts = MQTTAsync_responseOptions_initializer;
-    MQTTAsync_message message = MQTTAsync_message_initializer;
 
     while (pthread_mutex_lock(&(packetList.mutex))) {
         fprintf(stderr, "Error acquiring list mutex.\n");
@@ -670,14 +575,18 @@ void *sendToServer(void *arg) {
             break;
         }
 
-        JSONisePacket(packetList.head->data.pdata, buffer, ARRAY_SIZE(buffer));
-        message.payload = buffer;
-        message.payloadlen = strlen(buffer);
-        ret = MQTTAsync_sendMessage(MQTTClient, MQTTTopic, &message, &rOpts);
-        if (ret != MQTTASYNC_SUCCESS) {
-            //fprintf(stderr, "Error sending message.\n");
+        JSONisePacket(packetList.head->data, buffer, ARRAY_SIZE(buffer));
+        ret = mosquitto_publish(mosqConn, NULL, MQTTTopic, strlen(buffer), buffer, 0, 0);
+        if (ret == MOSQ_ERR_INVAL) {
+            fprintf(stderr, "Error sending message - Invalid parameters.\n");
+        } else if (ret == MOSQ_ERR_NO_CONN) {
+            fprintf(stderr, "Error sending message - No connection.\n");
+        } else if (ret == MOSQ_ERR_PROTOCOL) {
+            fprintf(stderr, "Error sending message - Protocol error.\n");
+        } else if (ret == MOSQ_ERR_PAYLOAD_SIZE) {
+            fprintf(stderr, "Error sending message - Payload too large.\n");
         } else {
-            removeFromHeadList(&packetList, 1, PACKET);
+            removeFromHeadList(&packetList, 1);
         }
     }
 
@@ -693,7 +602,8 @@ void *sendToServer(void *arg) {
 void JSONisePacket(struct wisnPacket *packet, char *buffer, int size) {
     memset(buffer, 0, size);
 
-    snprintf(buffer, size, "{\"time\":%llu,\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"rssi\":%d}",
-            packet->timestamp, packet->mac[0], packet->mac[1], packet->mac[2], packet->mac[3], packet->mac[4],
-            packet->mac[5], packet->rssi);
+    snprintf(buffer, size,
+            "{\"node\":%d,\"x\":%d,\"y\":%d,\"time\":%llu,\"mac\":\"%02X%02X%02X%02X%02X%02X\",\"rssi\":%d}",
+            packet->nodeNum, packet->x, packet->y, packet->timestamp, packet->mac[0], packet->mac[1],
+            packet->mac[2], packet->mac[3], packet->mac[4], packet->mac[5], packet->rssi);
 }

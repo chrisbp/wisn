@@ -1,14 +1,18 @@
 #ifndef WISN_PACKET
 #define WISN_PACKET
 
-#define PORT "1245"
-#define PACKET 0
+#include <stdio.h>
+#include <stdlib.h>
 
 struct wisnPacket {
     unsigned long long timestamp;
     unsigned char mac[6];
     char rssi;
-    unsigned short baseNum;
+    unsigned short nodeNum;
+    int x;
+    int y;
 } __attribute((packed));
+
+void printPacket(struct wisnPacket *wisnData);
 
 #endif

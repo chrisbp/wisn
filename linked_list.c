@@ -5,6 +5,7 @@ void initList(struct linkedList *linkedList) {
     linkedList->head = NULL;
     linkedList->tail = NULL;
     linkedList->size = 0;
+    linkedList->doSignal = 0;
     if (pthread_mutex_init(&(linkedList->mutex), NULL)) {
         fprintf(stderr, "Error creating list mutex.\n");
     }
@@ -14,14 +15,14 @@ void initList(struct linkedList *linkedList) {
 }
 
 //Deletes all contents and destroys the given linked list
-void destroyList(struct linkedList *linkedList, unsigned char type) {
+void destroyList(struct linkedList *linkedList) {
     if (pthread_mutex_lock(&(linkedList->mutex))) {
         fprintf(stderr, "Error acquiring list mutex.\n");
     }
 
     //Remove all contents
     while (linkedList->size > 0) {
-        removeFromHeadList(linkedList, 1, type);
+        removeFromHeadList(linkedList, 1);
     }
 
     if (pthread_mutex_unlock(&(linkedList->mutex))) {
@@ -40,15 +41,7 @@ void destroyList(struct linkedList *linkedList, unsigned char type) {
 //Adds the given packet to the tail of the given list
 struct linkedNode *addPacketToTailList(struct linkedList *linkedList, struct wisnPacket *packet) {
     struct linkedNode *node = (struct linkedNode *)malloc(sizeof(*node));
-    node->data.pdata = packet;
-    addToTailList(linkedList, node);
-    return node;
-}
-
-//Adds the given connection to the tail of the given list
-struct linkedNode *addConnectionToTailList(struct linkedList *linkedList, struct wisnConnection *connection) {
-    struct linkedNode *node = (struct linkedNode *)malloc(sizeof(*node));
-    node->data.cdata = connection;
+    node->data = packet;
     addToTailList(linkedList, node);
     return node;
 }
@@ -81,7 +74,7 @@ void addToTailList(struct linkedList *linkedList, struct linkedNode *node) {
 }
 
 //Removes the node at the head of the given list
-void removeFromHeadList(struct linkedList *linkedList, unsigned char haveLock, unsigned char type) {
+void removeFromHeadList(struct linkedList *linkedList, unsigned char haveLock) {
     if (linkedList->head != NULL) { //Check for empty list
         if (!haveLock) {
             if (pthread_mutex_lock(&(linkedList->mutex))) {
@@ -90,12 +83,8 @@ void removeFromHeadList(struct linkedList *linkedList, unsigned char haveLock, u
             }
         }
 
-        if (type == PACKET) {
-            free(linkedList->head->data.pdata);
-        } else {
-            close(linkedList->head->data.cdata->sockFD);
-            free(linkedList->head->data.cdata);
-        }
+        free(linkedList->head->data);
+
         if (linkedList->head->next == NULL) {   //Only one node in list
             free(linkedList->head);
             linkedList->head = NULL;
@@ -117,7 +106,7 @@ void removeFromHeadList(struct linkedList *linkedList, unsigned char haveLock, u
 }
 
 //Removes the given node from the given list
-void removeNode(struct linkedList *linkedList, struct linkedNode *node, unsigned char haveLock, unsigned char type) {
+void removeNode(struct linkedList *linkedList, struct linkedNode *node, unsigned char haveLock) {
     if (node != NULL) { //Check node exists
         if (!haveLock) {
             if (pthread_mutex_lock(&(linkedList->mutex))) {
@@ -126,12 +115,7 @@ void removeNode(struct linkedList *linkedList, struct linkedNode *node, unsigned
             }
         }
 
-        if (type == PACKET) {
-            free(node->data.pdata);
-        } else {
-            close(node->data.cdata->sockFD);
-            free(node->data.cdata);
-        }
+        free(node->data);
 
         if (node->prev == NULL) {   //Node is at head of queue
             if (node->next == NULL) {   //Only one node in list

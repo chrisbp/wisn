@@ -7,7 +7,6 @@
 #include <unistd.h>
 
 #include "wisn_packet.h"
-#include "wisn_connection.h"
 
 //Struct for linked list
 struct linkedList {
@@ -23,17 +22,13 @@ struct linkedList {
 struct linkedNode {
     struct linkedNode *next;
     struct linkedNode *prev;
-    union {
-        struct wisnPacket *pdata;
-        struct wisnConnection *cdata;
-    } data;
+    struct wisnPacket *data;
 };
 
 void initList(struct linkedList *linkedList);
-void destroyList(struct linkedList *linkedList, unsigned char type);
+void destroyList(struct linkedList *linkedList);
 struct linkedNode *addPacketToTailList(struct linkedList *linkedList, struct wisnPacket *packet);
-struct linkedNode *addConnectionToTailList(struct linkedList *linkedList, struct wisnConnection *connection);
 void addToTailList(struct linkedList *linkedList, struct linkedNode *node);
-void removeFromHeadList(struct linkedList *linkedList, unsigned char haveLock, unsigned char type);
-void removeNode(struct linkedList *linkedList, struct linkedNode *node, unsigned char haveLock, unsigned char type);
+void removeFromHeadList(struct linkedList *linkedList, unsigned char haveLock);
+void removeNode(struct linkedList *linkedList, struct linkedNode *node, unsigned char haveLock);
 #endif

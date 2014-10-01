@@ -5,26 +5,21 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
 
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <netdb.h>
 #include <signal.h>
 #include <unistd.h>
-#include <endian.h>
+#include <sys/types.h>
 #include <ifaddrs.h>
 #include <pthread.h>
 #include <pcap.h>
-#include <MQTTAsync.h>
 
 #include "wisn_packet.h"
 #include "radiotap.h"
 #include "radiotap_iter.h"
 #include "ieee80211.h"
 #include "linked_list.h"
+#include "mqtt.h"
 #include "khash.h"
 
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
@@ -41,13 +36,9 @@ char getChannel(short frequency);
 void* channelSwitcher(void *arg);
 char compareMAC(const unsigned char *mac1, const unsigned char *mac2);
 char checkInterface();
-//int connectToServer(char *serverAddress);
-//void *sendToServer(void *arg);
 unsigned char *serialiseWisnPacket(struct wisnPacket *packet, unsigned int *size);
 void signalList(struct linkedList *list);
-unsigned int connectToBroker(MQTTAsync *mqttClient, char *address, unsigned int baseNum);
-void connectionLost(void *context, char *cause);
-void connectFailed(void *context, MQTTAsync_failureData *response);
+unsigned int connectToBroker(char *address, unsigned int baseNum, int port);
 void *sendToServer(void *arg);
 void JSONisePacket(struct wisnPacket *packet, char *buffer, int size);
 #endif
