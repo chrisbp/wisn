@@ -6,7 +6,10 @@
 #include <pthread.h>
 #include <unistd.h>
 
-#include "wisn_packet.h"
+#define LIST_HAVE_LOCK 1
+#define LIST_NO_LOCK 0
+#define LIST_DELETE_DATA 1
+#define LIST_KEEP_DATA 0
 
 //Struct for linked list
 struct linkedList {
@@ -22,13 +25,14 @@ struct linkedList {
 struct linkedNode {
     struct linkedNode *next;
     struct linkedNode *prev;
-    struct wisnPacket *data;
+    void *data;
 };
 
 void initList(struct linkedList *linkedList);
 void destroyList(struct linkedList *linkedList);
-struct linkedNode *addPacketToTailList(struct linkedList *linkedList, struct wisnPacket *packet);
+struct linkedNode *addDataToTailList(struct linkedList *linkedList, void *packet);
 void addToTailList(struct linkedList *linkedList, struct linkedNode *node);
-void removeFromHeadList(struct linkedList *linkedList, unsigned char haveLock);
-void removeNode(struct linkedList *linkedList, struct linkedNode *node, unsigned char haveLock);
+void removeFromHeadList(struct linkedList *linkedList, unsigned char haveLock, unsigned char deleteData);
+void removeNode(struct linkedList *linkedList, struct linkedNode *node, unsigned char haveLock, unsigned char deleteData);
+
 #endif

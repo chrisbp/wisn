@@ -1,0 +1,29 @@
+html, body, #map-canvas {
+    height: 100%;
+    margin: 0px;
+    padding: 0px 
+}
+
+#infoWindow {
+    width: 120px;
+}
+/* Styles for right click context menu */
+.contextMenu {
+    background-color:white;
+    border:1px solid gray;
+}
+
+.contextMenuItem {
+    padding: 3px 6px;
+}
+
+.contextMenuItem:hover {
+    background-color: #CCCCCC;
+}
+
+.contextMenuSeparator {
+    background-color: gray;
+    height: 1px;
+    margin: 0;
+    padding: 0;
+}

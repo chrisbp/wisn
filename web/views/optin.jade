@@ -1,0 +1,28 @@
+doctype html
+html(lang="en")
+    meta(charset="UTF-8")
+    head
+        title= title
+        script.
+            var macRegex = /^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$/;
+            function validateForm() {
+                var fields = document.forms["optin"];
+                if (fields["name"].value == null || fields["name"].value == "") {
+                    return false;
+                }
+                if (fields["mac"].value != null && macRegex.test(fields["mac"].value)) {
+                    return true;
+                }
+                return false;
+            }
+    body
+        div
+            form(name="optin", action="/optin", onsubmit="return validateForm()", method="post")
+                div
+                    label(for="name") Name:
+                        input(id="name", type="text", value="", name="name")
+                div
+                    label(for="mac") MAC Address:
+                        input(id="mac", type="text", value="", name="mac")
+                div
+                    input(type="submit", value="Opt-in")

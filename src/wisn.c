@@ -1,6 +1,7 @@
 #include "wisn.h"
 
-KHASH_MAP_INIT_INT64(pckM, time_t)
+KHASH_MAP_INIT_INT64(pckM, struct linkedList *)
+KHASH_MAP_INIT_INT64(lastM, time_t)
 
 const char *ifplugdCommand = "ifplugd -i %s -k";                //Command to stop ifplugd
 const char *wpaSupCommand = "killall wpa_supplicant";           //Command to stop wpa_supplicant
@@ -10,7 +11,10 @@ const char *iwconfigChannelCommand = "iwconfig %s channel %d";  //Command to cha
 
 unsigned int nodeNum;   //Number of this base node
 char *wifiInterface;    //Name of wifi interface
-const char *usage = "Usage: wisn node_num wifi_interface mqtt_address [mqtt_port]\n"; //Usage string
+const char *usage = "Usage: wisn node_num wifi_interface [OPTIONS]\n\n"
+                    "-b broker\tMQTT broker to use\n"
+                    "-p port\t\tMQTT port to use\n"
+                    "-v\t\twisn version\n";         //Usage String
 
 pcap_t *pcapHandle;             //Pcap handle for the wifi interface to listen on
 volatile char isPcapOpen;       //Flag to indicate whether pcap handle is open or closed
@@ -20,14 +24,15 @@ pthread_t commsThread;          //Thread for communicating with MQTT broker
 volatile char isChannelThreadRunning;   //Flag for if channels switcher is running
 
 struct linkedList packetList;   //Linked list to queue up packets received over wifi
-khash_t(pckM) *packetMap;       //Hashmap for recently received packets
+khash_t(pckM) *packetMap;       //Hashmap for storing all averaged rssi readings
+khash_t(lastM) *lastSentMap;    //Hashmap for storing timestamp of the last packet sent to server
 
-#ifdef DISTANCE
-int movAvg[32];
-int movAvgSize = 0;
-#endif
+unsigned int packetTotals[NUMCHANNELS];
+unsigned int channelIndex;
+volatile char isChannelReady;
 
 struct mosquitto *mosqConn;     //MQTT connection handle
+char *mqttBroker;               //MQTT broker address
 int mqttPort;                   //MQTT broker port to connect on - default is 1883
 volatile char isMQTTCreated;    //Flag for if MQTTClient has been initialised
 volatile char isMQTTConnected;  //Flag for if connected to MQTT broker
@@ -39,40 +44,65 @@ int main(int argc, char *argv[]) {
     struct sigaction sa;
     pthread_attr_t attr;
 
-    if (argc > 4) {
+    mqttPort = MQTT_PORT;
+    mqttBroker = MQTT_BROKER;
+
+    if (argc > 1) {
+        if (strcmp(argv[1], "--help") == 0) {
+            printf("\n%s\n", usage);
+            return 0;
+        } else if (strcmp(argv[1], "-v") == 0) {
+            printf("\n%s\n", WISN_VERSION);
+            return 0;
+        }
+    }
+    if (argc > 3) {
         nodeNum = strtoul(argv[1], NULL, 10);
         if (nodeNum < 1) {
-            fprintf(stderr, "Invalid base number.\n");
-            exit(2);
+            fprintf(stderr, "Invalid node number.\n");
+            return 2;
         }
         memset(MQTTTopic, 0, ARRAY_SIZE(MQTTTopic));
         snprintf(MQTTTopic, ARRAY_SIZE(MQTTTopic), "wisn/wisn%03u", nodeNum);
 
         if (checkInterface(argv[2]) == 0) {
             fprintf(stderr, "No network interface with name %s found.\n", argv[2]);
-            exit(5);
+            return 3;
         } else {
             size = sizeof(char) * (strlen(argv[2]) + 1);
-            wifiInterface = (char *)calloc(1, size);
+            wifiInterface = calloc(1, size);
             memcpy(wifiInterface, argv[2], size);
         }
+
+        mqttPort = MQTT_PORT;
+
         if (argc > 4) {
-            mqttPort = strtoul(argv[4], NULL, 10);
-            if (mqttPort < 1 || mqttPort > 65535) {
-                fprintf(stderr, "Invalid port\n");
-                fprintf(stderr, usage);
-                exit(2);
+            enum argState state = ARG_NONE;
+            for (int i = 4; i < argc; i++) {
+                if (state == ARG_NONE) {
+                    if (strcmp(argv[i], "-p") == 0) {
+                        state = ARG_PORT;
+                    } else if (strcmp(argv[i], "-b") == 0) {
+                        state = ARG_BROKER;
+                    }
+                } else if (state == ARG_PORT) {
+                    mqttPort = strtoul(argv[i], NULL, 10);
+                    if (mqttPort < 1 || mqttPort > 65535) {
+                        fprintf(stderr, "Invalid port\n");
+                        fprintf(stderr, "%s", usage);
+                        return 4;
+                    }
+                    state = ARG_NONE;
+                } else if (state == ARG_BROKER) {
+                    mqttBroker = argv[i];
+                    state = ARG_NONE;
+                }
             }
-        } else {
-            mqttPort = MQTTPORT;
         }
 
-        isMQTTConnected = 0;
-        isMQTTCreated = 0;
-        connectToBroker(argv[3], nodeNum, mqttPort);
     } else {
-        fprintf(stderr, usage);
-        exit(1);
+        printf("\n%s\n", usage);
+        return 1;
     }
 
     //Setup signal handler
@@ -83,8 +113,15 @@ int main(int argc, char *argv[]) {
     isPcapOpen = 0;
     isChannelThreadRunning = 0;
     initList(&packetList);
+    memset(packetTotals, 0, ARRAY_SIZE(packetTotals));
+    channelIndex = 0;
+    isChannelReady = 1;
+    isMQTTConnected = 0;
+    isMQTTCreated = 0;
+    connectToBroker(mqttBroker, nodeNum, mqttPort);
 
     packetMap = kh_init(pckM);
+    lastSentMap = kh_init(lastM);
 
     runCommand(ifplugdCommand, wifiInterface); //Kill ifplugd on wlan0 since it interferes
     runCommand(wpaSupCommand, NULL);  //Kill wpa_supplicant since it interferes
@@ -92,7 +129,7 @@ int main(int argc, char *argv[]) {
     pcapHandle = initialisePcap("wlan0");
 
     if (pcapHandle == NULL) {
-        cleanup(6);
+        cleanup(5);
     }
 
     //Start channel switcher thread
@@ -180,9 +217,24 @@ void cleanup(int ret) {
         mosquitto_lib_cleanup();
     }
     destroyList(&packetList);
-    kh_destroy(pckM, packetMap);
+    destroyStoredData();
+    kh_destroy(lastM, lastSentMap);
     free(wifiInterface);
     exit(ret);
+}
+
+/* Clean up function for deleting and freeing all lists and map data.
+ */
+void destroyStoredData(void) {
+    struct linkedList *list;
+    for (khint64_t it = kh_begin(packetMap); it != kh_end(packetMap); it++) {
+        if (kh_exist(packetMap, it)) {
+            list = kh_value(packetMap, it);
+            destroyList(list);
+            free(list);
+        }
+    }
+    kh_destroy(pckM, packetMap);
 }
 
 /* Initialises the wifi interface and pcap handle.
@@ -247,37 +299,11 @@ void closePcap(pcap_t *pcapHandle) {
     }
 }
 
-#ifdef DISTANCE
-double getDistance(double rssi, int type) {
-    double res = 0;
-    if (type == 1) {        //iperf linear
-        res = (0.1994 * rssi) - 1.3107;
-    } else if (type == 2) { //iperf power
-        res = 0.0003 * pow(rssi, 2.9324);
-    } else if (type == 3) { //ping linear
-        res = (0.1551 * rssi) - 1.147;
-    } else if (type == 4) { //ping power
-        res = 0.0005 * pow(rssi, 2.5813);
-    } else if (type == 5) { //mr3040 linear
-        res = (0.1789 * rssi) - 1.4057;
-    } else if (type == 6) { //mr3040 power
-        res = 0.0003 * pow(rssi, 2.8125);
-    } else if (type == 7) { //mr3040setDist linear
-        res = (0.1782 * rssi) - 1.1795;
-    } else if (type == 8) { //mr3040setDist power
-        res = 0.0005 * pow(rssi, 2.7237);
-    } else if (type == 9) { //multiphone linear
-        res = (0.1637 * rssi) - 1.0448;
-    } else if (type == 10) { //multiphone power
-        res = 0.0002 * pow(rssi, 2.9179);
-    }
-    return res;
-}
-#endif
-
 /* Callback function for pcap loop. Is called every time a packet is received.
  */
-void readPacket(u_char *args, const struct pcap_pkthdr *header, const u_char *packet) {
+void readPacket(u_char *args, const struct pcap_pkthdr *header,
+                const u_char *packet) {
+
     struct wisnPacket *wisnData;
     struct ieee80211_header *ieee80211Header;
     unsigned short channel;
@@ -296,6 +322,11 @@ void readPacket(u_char *args, const struct pcap_pkthdr *header, const u_char *pa
         char buff[16];
         struct tm *tmInfo;
         time_t now = time(NULL);
+        struct linkedList *list;
+        struct linkedNode *node;
+        struct linkedNode *nextNode;
+        struct wisnPacket *nodePacket;
+        khint64_t it;
         unsigned long long mac = 0;
         /*if (get802Type(ieee80211Header) == IEEE80211_CONTROL && (get802Subtype(ieee80211Header) == 12 ||
           get802Subtype(ieee80211Header) == 13)) {
@@ -305,27 +336,14 @@ void readPacket(u_char *args, const struct pcap_pkthdr *header, const u_char *pa
         //}
 
         memcpy(&mac, addr, ARRAY_SIZE(ieee80211Header->address2));
-
-        khint_t it = kh_get(pckM, packetMap, mac);
-        if (it != kh_end(packetMap)) {
-            if (now - kh_value(packetMap, it) < 2) {
-                return;
-            } else {
-                kh_value(packetMap, it) = now;
-            }
-        } else {
-            it = kh_put(pckM, packetMap, mac, &ret);
-            kh_value(packetMap, it) = now;
-        }
-
-        wisnData = (struct wisnPacket *)malloc(sizeof(*wisnData));
+        wisnData = malloc(sizeof(*wisnData));
         wisnData->timestamp = (unsigned long long)now;
         memcpy(wisnData->mac, addr, ARRAY_SIZE(wisnData->mac));
         wisnData->nodeNum = nodeNum;
         wisnData->rssi = 0;
         channel = 0;
 
-        //Check for 
+        //Check for
         //if (radiotapHeader->it_present & 0x810) {
         while (!retval) {
             retval = ieee80211_radiotap_iterator_next(&iterator);
@@ -344,43 +362,66 @@ void readPacket(u_char *args, const struct pcap_pkthdr *header, const u_char *pa
             }
         }
         //}
+
+        //Increment channel packet counter if running
+        if (isChannelReady) {
+            packetTotals[channelIndex]++;
+        }
+
+        it = kh_get(pckM, packetMap, mac);
+        if (it != kh_end(packetMap)) { //An entry for this device already exists
+            list = kh_value(packetMap, it);
+            node = list->head;
+            while (node != NULL) {
+                nodePacket = node->data;
+                //Remove readings older than x minutes and prune to AVGNUM size
+                if (list->size > AVGNUM || now - nodePacket->timestamp > AVGTIMEOUT) {
+                    nextNode = node->next;
+                    removeNode(list, node, LIST_NO_LOCK, LIST_DELETE_DATA);
+                    node = nextNode;
+                } else {
+                    break;  //Chronological order so no nodes past current will be older
+                }
+            }
+        } else { //No entry exists
+            list = malloc(sizeof(struct linkedList));
+            initList(list);
+            it = kh_put(pckM, packetMap, mac, &ret);
+            kh_value(packetMap, it) = list;
+        }
+        addDataToTailList(list, clonePacket(wisnData));
+
+        //Calculate average reading from list
+        wisnData->rssi = 0;
+        node = list->head;
+        nodePacket = node->data;
+        while (node != NULL) {
+            wisnData->rssi += (double)nodePacket->rssi;
+            node = node->next;
+        }
+        wisnData->rssi /= (double)list->size;
+
         memset(buff, 0, ARRAY_SIZE(buff));
         tmInfo = localtime(&now);
         strftime(buff, ARRAY_SIZE(buff), "%X", tmInfo);
-        printf("time: %s, type: %u, subtype: %u, channel: %u %02X:%02X:%02X:%02X:%02X:%02X - %02X:%02X:%02X:%02X:%02X:%02X - %d dBm\n",
+        printf("time: %s, type: %u, subtype: %u, channel: %u %02X:%02X:%02X:%02X:%02X:%02X - %02X:%02X:%02X:%02X:%02X:%02X - %f dBm\n",
                 buff, get802Type(ieee80211Header), get802Subtype(ieee80211Header), getChannel(channel),
                 ieee80211Header->address1[0], ieee80211Header->address1[1], ieee80211Header->address1[2],
                 ieee80211Header->address1[3], ieee80211Header->address1[4], ieee80211Header->address1[5],
                 wisnData->mac[0], wisnData->mac[1], wisnData->mac[2], wisnData->mac[3], wisnData->mac[4],
                 wisnData->mac[5], wisnData->rssi);
-        #ifdef DISTANCE
-        double avg = 0;
-        movAvg[movAvgSize] = wisnData->rssi;
-        movAvgSize++;
-        if (movAvgSize == 1) {
-            avg = wisnData->rssi;
-        } else {
-            while (movAvgSize > 16) {
-                for (int i = 1; i < movAvgSize; i++) {
-                    movAvg[i - 1] = movAvg[i];
-                }
-                movAvg[movAvgSize - 1] = 0;
-                movAvgSize--;
-            }
-            for (int i = 0; i < movAvgSize; i++) {
-                avg += movAvg[i];
-            }
-            avg /= movAvgSize;
-        }
-        fprintf(stdout, "%f\n", avg);
-        //        fprintf(stdout, "distance 1: %f m, 2: %f m\n", getDistance(avg, 1), getDistance(avg, 2));
-        //        fprintf(stdout, "distance 3: %f m, 4: %f m\n", getDistance(avg, 3), getDistance(avg, 4));
-        //        fprintf(stdout, "distance 5: %f m, 6: %f m\n", getDistance(avg, 5), getDistance(avg, 6));
-        //        fprintf(stdout, "distance 7: %f m, 8: %f m\n", getDistance(avg, 7), getDistance(avg, 8));
-        fprintf(stdout, "distance 6: %f m, distance 9: %f m, 10: %f m\n", getDistance(avg, 6), getDistance(avg, 9), getDistance(avg, 10));
-        #endif
 
-        addPacketToTailList(&packetList, wisnData);
+        it = kh_get(lastM, lastSentMap, mac);
+        if (it != kh_end(lastSentMap)) { //An entry for this device already exists
+            if (now - kh_value(lastSentMap, it) > 0) {
+                kh_value(lastSentMap, it) = now;
+                addDataToTailList(&packetList, wisnData);
+            }
+        } else { //No existing entry
+            it = kh_put(lastM, lastSentMap, mac, &ret);
+            kh_value(lastSentMap, it) = now;
+            addDataToTailList(&packetList, wisnData);
+        }
     }
 }
 
@@ -389,9 +430,11 @@ void readPacket(u_char *args, const struct pcap_pkthdr *header, const u_char *pa
 void changeChannel(char channel) {
     char command[32];
     int retval;
+    printf("Changing channel to %d\n", channel);
     if (channel < 15 && channel > 0) {
         memset(command, 0, ARRAY_SIZE(command));
-        snprintf(command, ARRAY_SIZE(command), iwconfigChannelCommand, wifiInterface, channel);
+        snprintf(command, ARRAY_SIZE(command), iwconfigChannelCommand,
+                 wifiInterface, channel);
         retval = runCommand((const char *)command, NULL);
         if (retval != 0) {
             fprintf(stderr, "Error changing channel %d\n", retval);
@@ -418,28 +461,76 @@ char getChannel(short frequency) {
  * Only returns when the pcap handle is closed.
  */
 void *channelSwitcher(void *arg) {
-    char channelSkip = 1;
-    char currentChannel = 1;
     struct timespec sleepTime;
     struct timespec sleepTimeLeft;
-
-    sleepTime.tv_sec = 30;
-    //sleepTime.tv_nsec = 500000000L;
-    sleepTime.tv_nsec = 0;
-
-    changeChannel(1);
+    time_t channelTimes[NUMCHANNELS];
+    volatile unsigned char currentChannel = 0;
+    volatile unsigned char detectPhase = 1;
 
     while (isPcapOpen) {
-        changeChannel(currentChannel);
-        currentChannel += channelSkip;
-        if (currentChannel > 14 || currentChannel < 1) {
-            currentChannel = 1;
+        if (detectPhase) {
+            isChannelReady = 1;
+            currentChannel++;
+            channelIndex = currentChannel - 1;
+            changeChannel(currentChannel);
+            sleepTime.tv_sec = 21;
+            sleepTime.tv_nsec = 500000000L;
+            if (currentChannel == 14) {
+                detectPhase = 0;
+                currentChannel = 255;
+            }
+        } else {
+            if (currentChannel == 255) {
+                calculateChannelTimeSlices(channelTimes);
+                currentChannel = 0;
+            }
+            currentChannel++;
+            if (currentChannel > 14) {
+                detectPhase = 1;
+                currentChannel = 0;
+                continue;
+            }
+            channelIndex = currentChannel - 1;
+            if (channelTimes[channelIndex] > 0) {
+                sleepTime.tv_sec = channelTimes[channelIndex];
+                sleepTime.tv_nsec = 0;
+                changeChannel(currentChannel);
+            } else {
+                continue;
+            }
+            if (currentChannel == 14) {
+                detectPhase = 1;
+                currentChannel = 0;
+            }
         }
+
         while (nanosleep(&sleepTime, &sleepTimeLeft) != 0) {
             memcpy(&sleepTime, &sleepTimeLeft, sizeof(sleepTimeLeft));
         }
     }
     pthread_exit(NULL);
+}
+
+/* Calculates how much time to spend listening on each channel
+ */
+void calculateChannelTimeSlices(time_t *channelTime) {
+    unsigned int totalPackets = 0;
+
+    isChannelReady = 0;
+
+    for (int i = 0; i < ARRAY_SIZE(packetTotals); i++) {
+        totalPackets += packetTotals[i];
+    }
+
+    printf("Total packets: %d\n", totalPackets);
+    for (int i = 0; i < NUMCHANNELS; i++) {
+        channelTime[i] = 3600 * packetTotals[i] / totalPackets;
+        printf("Channel %d received %d packets, allocating %d seconds.\n",
+               i + 1, packetTotals[i], (int)channelTime[i]);
+        packetTotals[i] = 0;
+    }
+
+    //isChannelReady = 1;
 }
 
 /* Compares the two given MAC addresses
@@ -490,7 +581,7 @@ char checkInterface(char *interface) {
  *size = sizeof(packet->timestamp) + ARRAY_SIZE(packet->mac) +
  sizeof(packet->rssi) + sizeof(packet->nodeNum);
 
- buffer = (unsigned char *)malloc(*size);
+ buffer = malloc(*size);
  marker = buffer;
 
  packet->timestamp = htobe64(packet->timestamp);
@@ -586,7 +677,7 @@ void *sendToServer(void *arg) {
         } else if (ret == MOSQ_ERR_PAYLOAD_SIZE) {
             fprintf(stderr, "Error sending message - Payload too large.\n");
         } else {
-            removeFromHeadList(&packetList, 1);
+            removeFromHeadList(&packetList, LIST_HAVE_LOCK, LIST_DELETE_DATA);
         }
     }
 
@@ -603,7 +694,7 @@ void JSONisePacket(struct wisnPacket *packet, char *buffer, int size) {
     memset(buffer, 0, size);
 
     snprintf(buffer, size,
-            "{\"node\":%d,\"x\":%d,\"y\":%d,\"time\":%llu,\"mac\":\"%02X%02X%02X%02X%02X%02X\",\"rssi\":%d}",
-            packet->nodeNum, packet->x, packet->y, packet->timestamp, packet->mac[0], packet->mac[1],
+            "{\"node\":%d,\"time\":%llu,\"mac\":\"%02X%02X%02X%02X%02X%02X\",\"rssi\":%f}",
+            packet->nodeNum, packet->timestamp, packet->mac[0], packet->mac[1],
             packet->mac[2], packet->mac[3], packet->mac[4], packet->mac[5], packet->rssi);
 }
