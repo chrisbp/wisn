@@ -56,7 +56,7 @@ int main(int argc, char *argv[]) {
             return 0;
         }
     }
-    if (argc > 3) {
+    if (argc > 2) {
         nodeNum = strtoul(argv[1], NULL, 10);
         if (nodeNum < 1) {
             fprintf(stderr, "Invalid node number.\n");
@@ -76,9 +76,9 @@ int main(int argc, char *argv[]) {
 
         mqttPort = MQTT_PORT;
 
-        if (argc > 4) {
+        if (argc > 3) {
             enum argState state = ARG_NONE;
-            for (int i = 4; i < argc; i++) {
+            for (int i = 3; i < argc; i++) {
                 if (state == ARG_NONE) {
                     if (strcmp(argv[i], "-p") == 0) {
                         state = ARG_PORT;
