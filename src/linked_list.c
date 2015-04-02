@@ -15,14 +15,14 @@ void initList(struct linkedList *linkedList) {
 }
 
 //Deletes all contents and destroys the given linked list
-void destroyList(struct linkedList *linkedList) {
+void destroyList(struct linkedList *linkedList, unsigned char deleteData) {
     if (pthread_mutex_lock(&(linkedList->mutex))) {
         fprintf(stderr, "Error acquiring list mutex.\n");
     }
 
     //Remove all contents
     while (linkedList->size > 0) {
-        removeFromHeadList(linkedList, LIST_HAVE_LOCK, LIST_DELETE_DATA);
+        removeFromHeadList(linkedList, LIST_HAVE_LOCK, deleteData);
     }
 
     if (pthread_mutex_unlock(&(linkedList->mutex))) {

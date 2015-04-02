@@ -3,7 +3,6 @@
 KHASH_MAP_INIT_INT64(devM, struct linkedList *)
 KHASH_MAP_INIT_INT(nodeM, struct wisnNode *)
 
-struct linkedList calList;  //List of calibration points
 struct linkedList dataList; //List of data queued for processing
 
 const char *usage =  "Usage: wisn_server [OPTIONS]\n\n"
@@ -20,6 +19,9 @@ volatile char isDBInitialised = 0;  //Flag for if DB is initialised
 volatile char isRunning = 0;        //Flag for if data processing loop should run
 volatile char runUpdateNodes = 0;   //Flag for updating list of nodes
 volatile char runUpdateCal = 0;     //Flag for updating calibration
+volatile char runUpdateReg = 0;     //Flag for updating registered users
+volatile char isLocked = 0;         //Flag for main loop cleanup
+volatile char isWaiting = 0;        //Flag for main loop cleanup
 
 khash_t(devM) *deviceMap;           //Hashmap for all device lists
 khash_t(nodeM) *nodeMap;            //Hashmap for all node positions
@@ -28,6 +30,7 @@ mongoc_client_t *dbClient;          //Database client
 mongoc_collection_t *nodesCol;      //Collection of node positions
 mongoc_collection_t *positionsCol;  //Collection of device positions
 mongoc_collection_t *calibrationCol;//Collection of calibration positions
+mongoc_collection_t *registeredCol; //Collection of registered users
 bson_t *query;                      //Empty query to get everything in a collection
 
 double pointsPerMeter;     //Calibration data for converting between meters and co-ordinates
@@ -75,7 +78,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    initList(&calList);
+
     initList(&dataList);
     dataList.doSignal = 1;
     deviceMap = kh_init(devM);
@@ -86,12 +89,13 @@ int main(int argc, char *argv[]) {
     initialiseDBConnection(DB_URL, DB_NAME);
 
     //Setup signal handler
-    sa.sa_handler = cleanup;
+    sa.sa_handler = stopRunning;
     sigaction(SIGINT, &sa, 0);
     sigaction(SIGTERM, &sa, 0);
 
     updateCalibration();
     updateNodes();
+    updateRegisteredUsers();
 
     isRunning = 1;
 
@@ -99,17 +103,28 @@ int main(int argc, char *argv[]) {
         struct wisnPacket *packet;
         struct linkedList *list;
 
-        while (pthread_mutex_lock(&(dataList.mutex))) { //Lock mutex to access data queue
+        isLocked = 1;
+        while (pthread_mutex_lock(&(dataList.mutex)) && isRunning) { //Lock mutex to access data queue
             fprintf(stderr, "Error acquiring list mutex.\n");
         }
 
         while (dataList.head == NULL && isRunning) {    //If queue is empty, unlock mutex and wait
+            isWaiting = 1;
+            isLocked = 0;
             if (pthread_cond_wait(&(dataList.cond), &(dataList.mutex))) {
                 fprintf(stderr, "Error waiting for condition variable signal\n");
             }
+            isLocked = 1;
+            isWaiting = 0;
         }
 
         if (!isRunning) {
+            if (isLocked) {
+                if (pthread_mutex_unlock(&(dataList.mutex))) {
+                    fprintf(stderr, "Error releasing list mutex.\n");
+                }
+                isLocked = 0;
+            }
             break;
         }
 
@@ -121,6 +136,10 @@ int main(int argc, char *argv[]) {
             updateCalibration();
             runUpdateCal = 0;
         }
+        if (runUpdateReg) {     //Update registered users data
+            updateRegisteredUsers();
+            runUpdateReg = 0;
+        }
 
         packet = dataList.head->data; //Get packet to process
         removeFromHeadList(&dataList, LIST_HAVE_LOCK, LIST_KEEP_DATA);   //Remove from data queue
@@ -129,16 +148,32 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Error releasing list mutex.\n");
         }
 
+        printf("Packet: ");
         printPacket(packet);
         list = storeWisnPacket(packet); //Store the packet and get the list of packets for this device
         localiseDevice(list);   //Perform localisation for device
+    }
+
+    cleanup(0);
+}
+
+void stopRunning(int ret) {
+    isRunning = 0;
+    if (isWaiting) {
+        if (pthread_cond_signal(&(dataList.cond))) {
+            fprintf(stderr, "Error signalling condition variable.\n");
+        }
+    } else if (isLocked) {
+        if (pthread_mutex_unlock(&(dataList.mutex))) {
+            fprintf(stderr, "Error releasing list mutex.\n");
+        }
+        isLocked = 0;
     }
 }
 
 /* Cleanup function called before exit.
  */
 void cleanup(int ret) {
-    isRunning = 0;
     if (isMQTTConnected) {
         isMQTTConnected = 0;
         mosquitto_disconnect(mosqConn);
@@ -152,8 +187,7 @@ void cleanup(int ret) {
     if (isDBInitialised) {
         cleanupDB();
     }
-    destroyList(&calList);
-    destroyList(&dataList);
+    destroyList(&dataList, LIST_DELETE_DATA);
     destroyStoredData();
     exit(ret);
 }
@@ -167,7 +201,7 @@ void destroyStoredData(void) {
     for (khint64_t it = kh_begin(deviceMap); it != kh_end(deviceMap); it++) {
         if (kh_exist(deviceMap, it)) {
             list = kh_value(deviceMap, it);
-            destroyList(list);
+            destroyList(list, LIST_DELETE_DATA);
             free(list);
         }
     }
@@ -232,6 +266,8 @@ void receivedMessage(struct mosquitto *conn, void *args,
             runUpdateNodes = 1;
         } else if (strcmp(EVENT_CAL, message->payload) == 0) {
             runUpdateCal = 1;
+        } else if (strcmp(EVENT_USER, message->payload) == 0) {
+            runUpdateReg = 1;
         }
     } else if (strcmp(POSITIONS_TOPIC, message->topic) == 0) {
         //Ignore messages the server sends
@@ -293,6 +329,14 @@ unsigned char parseHexChar(char *string) {
     return value;
 }
 
+/* Reads a MAC address as a hex string and converts it to wisn's format.
+ */
+void stringToMAC(char *string, unsigned char *mac) {
+    for (int i = 0; i < strlen(string); i += 2) {
+        mac[i / 2] = parseHexChar(string + i);
+    }
+}
+
 /* Attempts to localise a device from the given list of received messages.
  */
 void localiseDevice(struct linkedList *deviceList) {
@@ -305,6 +349,10 @@ void localiseDevice(struct linkedList *deviceList) {
     struct wisnPacket *packet2 = NULL;
     char havePosition = 0;
     int numNodes = 0;
+
+    if (deviceList == NULL) {
+        return;
+    }
 
     pthread_mutex_lock(&deviceList->mutex);
 
@@ -517,8 +565,9 @@ void initialiseDBConnection(char *url, char *dbName) {
     mongoc_init();
     dbClient = mongoc_client_new(url);
     nodesCol = mongoc_client_get_collection(dbClient, dbName, DB_COL_NODES);
-    positionsCol = mongoc_client_get_collection(dbClient, dbName,DB_COL_POSITIONS);
+    positionsCol = mongoc_client_get_collection(dbClient, dbName, DB_COL_POSITIONS);
     calibrationCol = mongoc_client_get_collection(dbClient, dbName, DB_COL_CALIBRATION);
+    registeredCol = mongoc_client_get_collection(dbClient, dbName, DB_COL_REGISTERED);
     query = bson_new();
     isDBInitialised = 1;
 }
@@ -530,6 +579,7 @@ void cleanupDB(void) {
     mongoc_collection_destroy(nodesCol);
     mongoc_collection_destroy(positionsCol);
     mongoc_collection_destroy(calibrationCol);
+    mongoc_collection_destroy(registeredCol);
     mongoc_client_destroy(dbClient);
     mongoc_cleanup();
 }
@@ -540,28 +590,68 @@ void updateNodes(void) {
     const bson_t *doc;
     char *data;
     struct wisnNode *node;
+    struct wisnNode *oldNode;
+    struct linkedList nodeList;
+    struct linkedNode *tempNode;
     int ret;
+
+    initList(&nodeList);
 
     mongoc_cursor_t *cursor = mongoc_collection_find(nodesCol,
             MONGOC_QUERY_NONE, 0, 0, 0, query, NULL, NULL);
 
+    //Get all nodes
     while (mongoc_cursor_next(cursor, &doc)) {
         data = bson_as_json(doc, NULL);
         node = readJson(JSON_NODE, data);
+        printf("Node: %d at %f,%f\n", node->nodeNum, node->x, node->y);
 
-        khint_t nodeIt = kh_get(nodeM, nodeMap, node->nodeNum);
-        if (nodeIt != kh_end(nodeMap)) {    //There is already data for this node
-            struct wisnNode *oldNode = kh_value(nodeMap, nodeIt);
-            free(oldNode);
-        } else {    //No entry for this node, create new key
-            nodeIt = kh_put(nodeM, nodeMap, node->nodeNum, &ret);
-        }
-        kh_value(nodeMap, nodeIt) = node;   //Update node data
+        addDataToTailList(&nodeList, node); //Put nodes in a list
 
         bson_free(data);
     }
 
     mongoc_cursor_destroy(cursor);
+
+    //Check that all existing nodes are still valid
+    for (khint_t it = kh_begin(nodeMap); it != kh_end(nodeMap); it++) {
+        if (kh_exist(nodeMap, it)) {
+            char foundNode = 0;
+            for (struct linkedNode *nodeIt = nodeList.head; nodeIt != NULL;
+                 nodeIt = nodeIt->next) {
+
+                node = nodeIt->data;
+                if (kh_key(nodeMap, it) == node->nodeNum) { //If valid, update and remove from list
+                    foundNode = 1;
+                    oldNode = kh_value(nodeMap, it);
+                    free(oldNode);
+                    kh_value(nodeMap, it) = node;
+                    tempNode = nodeIt->prev;
+                    removeNode(&nodeList, nodeIt, LIST_NO_LOCK, LIST_KEEP_DATA);
+                    nodeIt = tempNode;
+                    break;
+                }
+            }
+
+            if (!foundNode) {   //Didn't find this node, so need to delete it
+                oldNode = kh_value(nodeMap, it);
+                free(oldNode);
+                kh_del(nodeM, nodeMap, it);
+            }
+        }
+    }
+
+    if (nodeList.size > 0) {
+        for (struct linkedNode *nodeIt = nodeList.head; nodeIt != NULL;
+             nodeIt = nodeIt->next) {
+
+            node = nodeIt->data;
+            khint_t nodeMIt = kh_put(nodeM, nodeMap, node->nodeNum, &ret);
+            kh_value(nodeMap, nodeMIt) = node;   //Update node data
+        }
+    }
+
+    destroyList(&nodeList, LIST_KEEP_DATA);
 }
 
 /* Reads the given JSON string and converts it and returns the specified
@@ -574,6 +664,7 @@ void *readJson(enum jsonType type, const char *json) {
     struct wisnPacket *wisnPacket = NULL;
     struct wisnNode *wisnNode = NULL;
     struct wisnCalibration *wisnCal = NULL;
+    struct wisnUser *wisnUser = NULL;
     unsigned long long mac = 0;
 
     //Check which struct needs to be initialised
@@ -583,6 +674,8 @@ void *readJson(enum jsonType type, const char *json) {
         wisnNode = malloc(sizeof(*wisnNode));
     } else if (type == JSON_CAL) {
         wisnCal = malloc(sizeof(*wisnCal));
+    } else if (type == JSON_USER) {
+        wisnUser = malloc(sizeof(*wisnUser));
     } else {
         return NULL;
     }
@@ -600,7 +693,7 @@ void *readJson(enum jsonType type, const char *json) {
                     state = PARSE_NODENUM;
                 } else if (type == JSON_DEVICE && strcmp(it, "time") == 0) {
                     state = PARSE_TIME;
-                } else if (type == JSON_DEVICE && strcmp(it, "mac") == 0) {
+                } else if ((type == JSON_DEVICE || type == JSON_USER) && strcmp(it, "mac") == 0) {
                     state = PARSE_MAC;
                 } else if (type == JSON_DEVICE && strcmp(it, "rssi") == 0) {
                     state = PARSE_RSSI;
@@ -617,8 +710,12 @@ void *readJson(enum jsonType type, const char *json) {
                 } else if (state == PARSE_TIME) {
                     wisnPacket->timestamp = strtoll(it, NULL, 10);
                 } else if (state == PARSE_MAC) {
-                    mac = strtoull(it, NULL, 16);
-                    ui64ToChars(mac, wisnPacket->mac);
+                    if (type == JSON_DEVICE) {
+                        mac = strtoull(it, NULL, 16);
+                        ui64ToChars(mac, wisnPacket->mac);
+                    } else if (type == JSON_USER) {
+                        stringToMAC(it, wisnUser->mac);
+                    }
                 } else if (state == PARSE_RSSI) {
                     wisnPacket->rssi = strtol(it, NULL, 10);
                 } else if (state == PARSE_NAME) {
@@ -672,6 +769,8 @@ void *readJson(enum jsonType type, const char *json) {
         return wisnNode;
     } else if (type == JSON_CAL) {
         return wisnCal;
+    } else if (type == JSON_USER) {
+        return wisnUser;
     } else {
         return NULL;
     }
@@ -682,7 +781,13 @@ void *readJson(enum jsonType type, const char *json) {
 void updateCalibration(void) {
     const bson_t *doc;
     char *data;
+    struct linkedList calList;
+    struct linkedNode *node;
     struct wisnCalibration *cal = NULL;
+    struct wisnCalibration *calIt = NULL;
+    char foundPair = 0;
+
+    initList(&calList);
 
     mongoc_cursor_t *cursor = mongoc_collection_find(calibrationCol,
             MONGOC_QUERY_NONE, 0, 0, 0, query, NULL, NULL);
@@ -702,9 +807,7 @@ void updateCalibration(void) {
         fprintf(stderr, "Error acquiring list mutex.\n");
     }
 
-    char foundPair = 0;
-    struct linkedNode *node = calList.head;
-    struct wisnCalibration *calIt = NULL;
+    node = calList.head;
     while (!foundPair && node != NULL) {
         cal = node->data;
         for (struct linkedNode *nodeIt = node->next; nodeIt != NULL;
@@ -734,6 +837,8 @@ void updateCalibration(void) {
     if (pthread_mutex_unlock(&(calList.mutex))) {
         fprintf(stderr, "Error releasing list mutex.\n");
     }
+
+    destroyList(&calList, LIST_DELETE_DATA);
 }
 
 /* Returns the larger value of a and b.
@@ -773,7 +878,6 @@ struct wisnNode *getNode(unsigned short nodeNum) {
  */
 struct linkedList *storeWisnPacket(struct wisnPacket *packet) {
     struct linkedList *list;
-    int ret;
     unsigned long long mac;
 
     mac = charsToui64(packet->mac);
@@ -793,13 +897,11 @@ struct linkedList *storeWisnPacket(struct wisnPacket *packet) {
                 node = node->next;
             }
         }
-    } else {    //no list exists yet
-        list = malloc(sizeof(struct linkedList));
-        initList(list);
-        devIt = kh_put(devM, deviceMap, mac, &ret);
-        kh_value(deviceMap, devIt) = list;
+        addDataToTailList(list, packet);
+    } else {    //This device is unregistered - no list exists yet
+        list = NULL;
     }
-    addDataToTailList(list, packet);
+
     return list;
 }
 
@@ -834,4 +936,79 @@ void JSONisePosition(struct wisnPacket *packet, double xPos, double yPos,
             "{\"mac\":\"%02X%02X%02X%02X%02X%02X\",\"x\":%f,\"y\":%f}",
             packet->mac[0], packet->mac[1], packet->mac[2], packet->mac[3],
             packet->mac[4], packet->mac[5], xPos, yPos);
+}
+
+/* Updates the list of registered devices.
+ */
+void updateRegisteredUsers(void) {
+    const bson_t *doc;
+    char *data;
+    struct wisnUser *user;
+    unsigned long long mac;
+    struct linkedList userList;
+    struct linkedList *list;
+    struct linkedNode *tempNode;
+    int ret;
+
+    initList(&userList);
+
+    mongoc_cursor_t *cursor = mongoc_collection_find(registeredCol,
+            MONGOC_QUERY_NONE, 0, 0, 0, query, NULL, NULL);
+
+    //Get all users
+    while (mongoc_cursor_next(cursor, &doc)) {
+        data = bson_as_json(doc, NULL);
+        user = readJson(JSON_USER, data);
+        printf("User: %02X%02X%02X%02X%02X%02X\n", user->mac[0], user->mac[1],
+               user->mac[2], user->mac[3], user->mac[4], user->mac[5]);
+
+        addDataToTailList(&userList, user); //Put users in a list
+
+        bson_free(data);
+    }
+
+    mongoc_cursor_destroy(cursor);
+
+    //Check that all existing device lists are still valid
+    for (khint64_t it = kh_begin(deviceMap); it != kh_end(deviceMap); it++) {
+        if (kh_exist(deviceMap, it)) {
+            char foundUser = 0;
+            for (struct linkedNode *nodeIt = userList.head; nodeIt != NULL;
+                 nodeIt = nodeIt->next) {
+
+                user = nodeIt->data;
+                mac = charsToui64(user->mac);
+                if (kh_key(deviceMap, it) == mac) { //If valid, remove from list
+                    foundUser = 1;
+                    tempNode = nodeIt->prev;
+                    removeNode(&userList, nodeIt, LIST_NO_LOCK, LIST_DELETE_DATA);
+                    nodeIt = tempNode;
+                    break;
+                }
+            }
+
+            if (!foundUser) {   //Didn't find this user, so need to delete it
+                list = kh_value(deviceMap, it);
+                destroyList(list, LIST_DELETE_DATA);
+                free(list);
+                kh_del(devM, deviceMap, it);
+            }
+        }
+    }
+
+    //If userList still has entries, these will be new users
+    if (userList.size > 0) {
+        for (struct linkedNode *nodeIt = userList.head; nodeIt != NULL;
+             nodeIt = nodeIt->next) {
+
+            user = nodeIt->data;
+            mac = charsToui64(user->mac);
+            list = malloc(sizeof(struct linkedList));
+            initList(list);
+            khint64_t devIt = kh_put(devM, deviceMap, mac, &ret);
+            kh_value(deviceMap, devIt) = list;
+        }
+    }
+
+    destroyList(&userList, LIST_DELETE_DATA);
 }

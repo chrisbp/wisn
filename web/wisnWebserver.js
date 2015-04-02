@@ -95,6 +95,7 @@ app.post("/optin", function (req, res) {
                     throw err;
                 }
             });
+            client.publish(eventsTopic, "userUpdate");
             res.render("success", { title: "Wisn Opt-in Success" });
         }
     });
@@ -122,6 +123,7 @@ app.post("/optout", function (req, res) {
                     throw err;
                 }
             });
+            client.publish(eventsTopic, "userUpdate");
             res.render("success", { title: "Wisn Opt-out Success" });
         }
     });

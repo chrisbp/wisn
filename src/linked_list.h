@@ -29,8 +29,8 @@ struct linkedNode {
 };
 
 void initList(struct linkedList *linkedList);
-void destroyList(struct linkedList *linkedList);
-struct linkedNode *addDataToTailList(struct linkedList *linkedList, void *packet);
+void destroyList(struct linkedList *linkedList, unsigned char deleteData);
+struct linkedNode *addDataToTailList(struct linkedList *linkedList, void *data);
 void addToTailList(struct linkedList *linkedList, struct linkedNode *node);
 void removeFromHeadList(struct linkedList *linkedList, unsigned char haveLock, unsigned char deleteData);
 void removeNode(struct linkedList *linkedList, struct linkedNode *node, unsigned char haveLock, unsigned char deleteData);

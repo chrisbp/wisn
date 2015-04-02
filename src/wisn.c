@@ -216,7 +216,7 @@ void cleanup(int ret) {
         mosquitto_destroy(mosqConn);
         mosquitto_lib_cleanup();
     }
-    destroyList(&packetList);
+    destroyList(&packetList, LIST_DELETE_DATA);
     destroyStoredData();
     kh_destroy(lastM, lastSentMap);
     free(wifiInterface);
@@ -230,7 +230,7 @@ void destroyStoredData(void) {
     for (khint64_t it = kh_begin(packetMap); it != kh_end(packetMap); it++) {
         if (kh_exist(packetMap, it)) {
             list = kh_value(packetMap, it);
-            destroyList(list);
+            destroyList(list, LIST_DELETE_DATA);
             free(list);
         }
     }
