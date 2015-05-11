@@ -14,7 +14,7 @@ char *wifiInterface;    //Name of wifi interface
 const char *usage = "Usage: wisn node_num wifi_interface [OPTIONS]\n\n"
                     "-b broker\tMQTT broker to use\n"
                     "-p port\t\tMQTT port to use\n"
-                    "-c channel\tOnly listen on the specified wireless channel"
+                    "-c channel\tOnly listen on the specified wireless channel\n"
                     "-v\t\twisn version\n";         //Usage String
 
 pcap_t *pcapHandle;             //Pcap handle for the wifi interface to listen on
