@@ -27,7 +27,7 @@
 #define AVGTIMEOUT 300
 #define AVGNUM 32
 
-enum argState {ARG_NONE, ARG_PORT, ARG_BROKER};
+enum argState {ARG_NONE, ARG_PORT, ARG_BROKER, ARG_CHANNEL};
 
 int main(int argc, char *argv[]);
 //int runCommand(char *command, char **args);

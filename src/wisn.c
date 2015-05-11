@@ -30,6 +30,7 @@ khash_t(lastM) *lastSentMap;    //Hashmap for storing timestamp of the last pack
 unsigned int packetTotals[NUMCHANNELS];
 unsigned int channelIndex;
 volatile char isChannelReady;
+int singleChannel;              //The channel to listen on if set
 
 struct mosquitto *mosqConn;     //MQTT connection handle
 char *mqttBroker;               //MQTT broker address
@@ -84,6 +85,8 @@ int main(int argc, char *argv[]) {
                         state = ARG_PORT;
                     } else if (strcmp(argv[i], "-b") == 0) {
                         state = ARG_BROKER;
+                    } else if (strcmp(argv[i], "-c") == 0) {
+                        state = ARG_CHANNEL;
                     }
                 } else if (state == ARG_PORT) {
                     mqttPort = strtoul(argv[i], NULL, 10);
@@ -95,6 +98,14 @@ int main(int argc, char *argv[]) {
                     state = ARG_NONE;
                 } else if (state == ARG_BROKER) {
                     mqttBroker = argv[i];
+                    state = ARG_NONE;
+                } else if (state == ARG_CHANNEL) {
+                    singleChannel = strtol(argv[i], NULL, 10);
+                    if (singleChannel < 1 || singleChannel > 14) {
+                        fprintf(stderr, "Invalid channel\n");
+                        fprintf(stderr, "%s", usage);
+                        return 5;
+                    }
                     state = ARG_NONE;
                 }
             }
@@ -115,7 +126,11 @@ int main(int argc, char *argv[]) {
     initList(&packetList);
     memset(packetTotals, 0, ARRAY_SIZE(packetTotals));
     channelIndex = 0;
-    isChannelReady = 1;
+    if (singleChannel) {
+        isChannelReady = 0;
+    } else {
+        isChannelReady = 1;
+    }
     isMQTTConnected = 0;
     isMQTTCreated = 0;
     connectToBroker(mqttBroker, nodeNum, mqttPort);
@@ -466,6 +481,11 @@ void *channelSwitcher(void *arg) {
     time_t channelTimes[NUMCHANNELS];
     volatile unsigned char currentChannel = 0;
     volatile unsigned char detectPhase = 1;
+
+    if (singleChannel) {
+        changeChannel(singleChannel);
+        pthread_exit(NULL);
+    }
 
     while (isPcapOpen) {
         if (detectPhase) {
