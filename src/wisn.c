@@ -391,7 +391,7 @@ void readPacket(u_char *args, const struct pcap_pkthdr *header,
             while (node != NULL) {
                 nodePacket = node->data;
                 //Remove readings older than x minutes and prune to AVGNUM size
-                if (list->size > AVGNUM || now - nodePacket->timestamp > AVGTIMEOUT) {
+                if (list->size >= AVGNUM || now - nodePacket->timestamp > AVGTIMEOUT) {
                     nextNode = node->next;
                     removeNode(list, node, LIST_NO_LOCK, LIST_DELETE_DATA);
                     node = nextNode;
@@ -410,12 +410,21 @@ void readPacket(u_char *args, const struct pcap_pkthdr *header,
         //Calculate average reading from list
         wisnData->rssi = 0;
         node = list->head;
-        nodePacket = node->data;
         while (node != NULL) {
+            nodePacket = node->data;
             wisnData->rssi += (double)nodePacket->rssi;
             node = node->next;
         }
         wisnData->rssi /= (double)list->size;
+
+        //Check if the newest RSSI reading is an outlier and remove if so
+        nodePacket = list->tail->data;
+        if (nodePacket->rssi > 2 * wisnData->rssi || nodePacket->rssi < 0.5 * wisnData->rssi) {
+            printf("OUTLIER FOUND! - %f\n", nodePacket->rssi);
+            removeNode(list, list->tail, LIST_NO_LOCK, LIST_DELETE_DATA);
+            free(wisnData);
+            return;
+        }
 
         memset(buff, 0, ARRAY_SIZE(buff));
         tmInfo = localtime(&now);

@@ -503,11 +503,13 @@ void removeOldData(struct linkedList *deviceList) {
 }
 
 /* Calculates the distance between a device and node based on the RSSI.
+ * Uses the Log-Distance formula.
  * Returns a distance scaled by calibration value.
- * distance = 0.0002 * (rssi ^ 2.9179) * scaleFactor
  */
 double getDistance(double rssi) {
-    return 0.0002 * pow(rssi, 2.9179) * pointsPerMeter;
+    double PLZero = 13.0563;
+    double loss = 2.0;
+    return pow(10, (rssi - PLZero) / (10 * loss)) * pointsPerMeter;
 }
 
 /* Calculates an element for matrix A.
