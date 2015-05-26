@@ -23,6 +23,7 @@
 #include "wisn_calibration.h"
 #include "wisn_version.h"
 #include "wisn_user.h"
+#include "wisn_location.h"
 #include "mqtt.h"
 #include "khash.h"
 
@@ -34,13 +35,14 @@
 #define EVENT_NODE "nodeUpdate"
 #define EVENT_CAL "calibrationUpdate"
 #define EVENT_USER "userUpdate"
-#define TIMEOUT 300
+#define TIMEOUT 10
 #define DB_URL "mongodb://localhost:27020/"
 #define DB_NAME "wisn"
 #define DB_COL_NODES "nodes"
 #define DB_COL_POSITIONS "positions"
 #define DB_COL_CALIBRATION "calibration"
 #define DB_COL_REGISTERED "names"
+#define LOC_NUM_AVG 8
 
 enum argState {ARG_NONE, ARG_BROKER, ARG_PORT};
 enum parseState {PARSE_NODENUM, PARSE_TIME, PARSE_MAC, PARSE_RSSI, PARSE_NAME,
@@ -65,7 +67,7 @@ void ui64ToChars(unsigned long long mac, unsigned char *dest);
 unsigned long long charsToui64(unsigned char *mac);
 unsigned char parseHexChar(char *string);
 void stringToMAC(char *string, unsigned char *mac);
-void localiseDevice(struct linkedList *deviceList);
+void localiseDevice(struct linkedList *deviceList, struct linkedList *locationList);
 void removeOldData(struct linkedList *deviceList);
 double getDistance(double rssi);
 double calculateElementA(double xk, double xi);
@@ -81,10 +83,14 @@ char *findCharStart(char *string);
 void updateCalibration(void);
 double max(double a, double b);
 double min(double a, double b);
+double dDiff(double a, double b);
+long lDiff(long a, long b);
 struct wisnNode *getNode(unsigned short nodeNum);
 struct linkedList *storeWisnPacket(struct wisnPacket *packet);
-void updatePositionDB(struct wisnPacket *packet, double x, double y);
-void JSONisePosition(struct wisnPacket *packet, double xPos, double yPos, char *buffer, int size);
+struct linkedList *getLocationList(unsigned char *mac);
+void updatePositionDB(struct wisnPacket *packet, double x, double y, double radius);
+void JSONisePosition(struct wisnPacket *packet, double xPos, double yPos, double radius, char *buffer, int size);
 void updateRegisteredUsers(void);
+double calculateArea(struct linkedList *list, double *xPos, double *yPos);
 
 #endif

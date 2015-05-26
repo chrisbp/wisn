@@ -6,6 +6,10 @@ WisnNode.prototype.setMarker = function (marker) {
     this.marker = marker;
 }
 
+WisnNode.prototype.setCircle = function (circle) {
+    this.circle = circle;
+}
+
 WisnNode.prototype.setName = function (name) {
     this.name = name;
 }
@@ -16,6 +20,10 @@ WisnNode.prototype.setX = function (xPos) {
 
 WisnNode.prototype.setY = function (yPos) {
     this.y = yPos;
+}
+
+WisnNode.prototype.setR = function (radius) {
+    this.r = radius;
 }
 
 WisnNode.prototype.setPoint = function (point) {

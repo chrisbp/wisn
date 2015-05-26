@@ -55,7 +55,7 @@ app.use(express.static(__dirname + "/images"));
 
 app.get("/", function (req, res) {
     res.render("map", { title: "Map Test",
-                        scripts: ["https://maps.googleapis.com/maps/api/js?v=3.exp",
+                        scripts: ["https://maps.googleapis.com/maps/api/js?v=3",
                                   "/socket.io/socket.io.js",
                                   "wisnNode.js",
                                   "ContextMenu.js",
@@ -64,7 +64,7 @@ app.get("/", function (req, res) {
 
 app.get("/edit", function (req, res) {
     res.render("map", { title: "Edit Map Test",
-                        scripts: ["https://maps.googleapis.com/maps/api/js?v=3.exp",
+                        scripts: ["https://maps.googleapis.com/maps/api/js?v=3",
                                   "/socket.io/socket.io.js",
                                   "wisnNode.js",
                                   "ContextMenu.js",
@@ -87,7 +87,6 @@ app.post("/optin", function (req, res) {
         if (data["name"] != null && data["mac"] != null) {
             var mac = data["mac"].toUpperCase();
             mac = mac.replace(/(:|-)/g, "");
-            console.log("MAC is " + mac);
             namesCol.update({ mac: mac }, { $set: { name: data["name"] } },
                             { upsert: true }, function (err, docs) {
 
@@ -96,7 +95,7 @@ app.post("/optin", function (req, res) {
                 }
             });
             client.publish(eventsTopic, "userUpdate");
-            res.render("success", { title: "Wisn Opt-in Success" });
+            res.render("optinsuccess", { title: "Wisn Opt-in Success" });
         }
     });
 });
@@ -117,15 +116,31 @@ app.post("/optout", function (req, res) {
         if (data["mac"] != null) {
             var mac = data["mac"].toUpperCase();
             mac = mac.replace(/(:|-)/g, "");
-            console.log("MAC is " + mac);
             namesCol.remove({ mac: mac }, function (err, result) {
                 if (err != null) {
                     throw err;
                 }
             });
             client.publish(eventsTopic, "userUpdate");
-            res.render("success", { title: "Wisn Opt-out Success" });
+            res.render("optoutsuccess", { title: "Wisn Opt-out Success" });
         }
+    });
+});
+
+app.get("/users", function (req, res) {
+    res.writeHead(200, {
+        'Content-Type': 'text/html'
+    });
+    var dataStream = namesCol.find({}).stream();
+    dataStream.on("data", function (data) {
+        dataStream.pause();
+        if (data != null) {
+            res.write(data.mac + "  -  " + data.name + "<br>");
+        }
+        dataStream.resume();
+    });
+    dataStream.on("end", function() {
+        res.end();
     });
 });
 
@@ -277,8 +292,8 @@ function sendAllPositions(socket) {
         dataStream.pause();
         namesCol.findOne({mac:data.mac}, function (err, nameData) {
             if (err == null && nameData != null) {
-                socket.emit('addDevice', { name: nameData.name, x: data.x, y: data.y });
-                console.log("Sending " + nameData.name + " at (" + data.x + ", " + data.y + ")");
+                socket.emit('addDevice', { name: nameData.name, x: data.x, y: data.y, r: data.r });
+                console.log("Sending " + nameData.name + " at (" + data.x + ", " + data.y + ")" + " R " + data.r);
             }
         });
         dataStream.resume();
@@ -288,8 +303,8 @@ function sendAllPositions(socket) {
 function sendPosition(data) {
     namesCol.findOne({mac:data.mac}, function (err, nameData) {
         if (err == null && nameData != null) {
-            io.emit('addDevice', { name: nameData.name, x: data.x, y: data.y });
-            console.log("Sending " + nameData.name + " at (" + data.x + ", " + data.y + ")");
+            io.emit('addDevice', { name: nameData.name, x: data.x, y: data.y, r: data.r });
+            console.log("Sending " + nameData.name + " at (" + data.x + ", " + data.y + ")" + " R " + data.r);
         }
     });
 }

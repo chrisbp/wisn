@@ -1,6 +1,7 @@
 #include "wisn_server.h"
 
 KHASH_MAP_INIT_INT64(devM, struct linkedList *)
+KHASH_MAP_INIT_INT64(locM, struct linkedList *)
 KHASH_MAP_INIT_INT(nodeM, struct wisnNode *)
 
 struct linkedList dataList; //List of data queued for processing
@@ -23,7 +24,8 @@ volatile char runUpdateReg = 0;     //Flag for updating registered users
 volatile char isLocked = 0;         //Flag for main loop cleanup
 volatile char isWaiting = 0;        //Flag for main loop cleanup
 
-khash_t(devM) *deviceMap;           //Hashmap for all device lists
+khash_t(devM) *deviceMap;           //Hashmap for all device packet lists
+khash_t(locM) *locationMap;         //Hashmap for all device location lists
 khash_t(nodeM) *nodeMap;            //Hashmap for all node positions
 
 mongoc_client_t *dbClient;          //Database client
@@ -82,6 +84,7 @@ int main(int argc, char *argv[]) {
     initList(&dataList);
     dataList.doSignal = 1;
     deviceMap = kh_init(devM);
+    locationMap = kh_init(locM);
     nodeMap = kh_init(nodeM);
     if (connectToBroker(mqttBroker, mqttPort) != MOSQ_ERR_SUCCESS) {
         cleanup(2);
@@ -102,6 +105,7 @@ int main(int argc, char *argv[]) {
     while (isRunning) {
         struct wisnPacket *packet;
         struct linkedList *list;
+        struct linkedList *locList;
 
         isLocked = 1;
         while (pthread_mutex_lock(&(dataList.mutex)) && isRunning) { //Lock mutex to access data queue
@@ -151,7 +155,10 @@ int main(int argc, char *argv[]) {
         printf("Packet: ");
         printPacket(packet);
         list = storeWisnPacket(packet); //Store the packet and get the list of packets for this device
-        localiseDevice(list);   //Perform localisation for device
+        if (list != NULL) {
+            locList = getLocationList(packet->mac); //Get the list of locations last calculated
+            localiseDevice(list, locList);   //Perform localisation for device
+        }
     }
 
     cleanup(0);
@@ -206,6 +213,15 @@ void destroyStoredData(void) {
         }
     }
     kh_destroy(devM, deviceMap);
+
+    for (khint64_t it = kh_begin(locationMap); it != kh_end(locationMap); it++) {
+        if (kh_exist(locationMap, it)) {
+            list = kh_value(locationMap, it);
+            destroyList(list, LIST_DELETE_DATA);
+            free(list);
+        }
+    }
+    kh_destroy(locM, locationMap);
 
     for (khint_t it = kh_begin(nodeMap); it != kh_end(nodeMap); it++) {
         if (kh_exist(nodeMap, it)) {
@@ -339,7 +355,7 @@ void stringToMAC(char *string, unsigned char *mac) {
 
 /* Attempts to localise a device from the given list of received messages.
  */
-void localiseDevice(struct linkedList *deviceList) {
+void localiseDevice(struct linkedList *deviceList, struct linkedList *locationList) {
     double xPos;
     double yPos;
     char buffer[128];
@@ -349,10 +365,6 @@ void localiseDevice(struct linkedList *deviceList) {
     struct wisnPacket *packet2 = NULL;
     char havePosition = 0;
     int numNodes = 0;
-
-    if (deviceList == NULL) {
-        return;
-    }
 
     pthread_mutex_lock(&deviceList->mutex);
 
@@ -468,11 +480,24 @@ void localiseDevice(struct linkedList *deviceList) {
 
     //If there is a position inside the bounds, send it
     if (havePosition) {
-        printf("Type %d - %02X:%02X:%02X:%02X:%02X:%02X at (%.1f, %.1f)\n",
+        struct wisnLocation *location = malloc(sizeof(struct wisnLocation));
+        location->mac = charsToui64(packet1->mac);
+        location->x = xPos;
+        location->y = yPos;
+        addDataToTailList(locationList, location);
+
+        while (locationList->size > LOC_NUM_AVG) {
+            removeFromHeadList(locationList, LIST_NO_LOCK, LIST_DELETE_DATA);
+        }
+
+        //Calculate approximate device area
+        double radius = calculateArea(locationList, &xPos, &yPos);
+
+        printf("Type %d - %02X:%02X:%02X:%02X:%02X:%02X at (%.1f, %.1f) R %.1f\n",
                havePosition, packet1->mac[0], packet1->mac[1], packet1->mac[2],
-               packet1->mac[3], packet1->mac[4], packet1->mac[5], xPos, yPos);
-        updatePositionDB(packet1, xPos, yPos);
-        JSONisePosition(packet1, xPos, yPos, buffer, ARRAY_SIZE(buffer));
+               packet1->mac[3], packet1->mac[4], packet1->mac[5], xPos, yPos, radius);
+        updatePositionDB(packet1, xPos, yPos, radius);
+        JSONisePosition(packet1, xPos, yPos, radius, buffer, ARRAY_SIZE(buffer));
         mosquitto_publish(mosqConn, NULL, POSITIONS_TOPIC, strlen(buffer),
                           buffer, 0, 0);
     }
@@ -491,7 +516,7 @@ void removeOldData(struct linkedList *deviceList) {
         node = deviceList->head;    //Head will have oldest data
         while (node != NULL) {
             packet = node->data;
-            if (now - packet->timestamp > TIMEOUT) {
+            if (lDiff(now, packet->timestamp) > TIMEOUT) {
                 nextNode = node->next;
                 removeNode(deviceList, node, LIST_HAVE_LOCK, LIST_DELETE_DATA);
                 node = nextNode;
@@ -507,8 +532,8 @@ void removeOldData(struct linkedList *deviceList) {
  * Returns a distance scaled by calibration value.
  */
 double getDistance(double rssi) {
-    double PLZero = 13.0563;
-    double loss = 2.0;
+    double PLZero = 20.0;
+    double loss = 4.0;
     return pow(10, (rssi - PLZero) / (10 * loss)) * pointsPerMeter;
 }
 
@@ -829,8 +854,8 @@ void updateCalibration(void) {
     if (node == NULL) {
         pointsPerMeter = 1.0;
     } else {
-        double xDist = max(cal->x, calIt->x) - min(cal->x, calIt->x);
-        double yDist = max(cal->y, calIt->y) - min(cal->y, calIt->y);
+        double xDist = dDiff(cal->x, calIt->x);
+        double yDist = dDiff(cal->y, calIt->y);
         pointsPerMeter = max(xDist, yDist) / cal->calibration;
     }
 
@@ -860,6 +885,28 @@ double min(double a, double b) {
         return a;
     } else {
         return b;
+    }
+}
+
+/* Returns the difference between the two given values.
+ * Always substracts the smaller from the bigger.
+ */
+double dDiff(double a, double b) {
+    if (a > b) {
+        return a - b;
+    } else {
+        return b - a;
+    }
+}
+
+/* Returns the difference between the two given values.
+ * Always subtracts the smaller from the bigger.
+ */
+long lDiff(long a, long b) {
+    if (a > b) {
+        return a - b;
+    } else {
+        return b - a;
     }
 }
 
@@ -907,9 +954,26 @@ struct linkedList *storeWisnPacket(struct wisnPacket *packet) {
     return list;
 }
 
+/* Returns the list of previous calculated locations for the given device.
+ */
+struct linkedList *getLocationList(unsigned char *mac) {
+    struct linkedList *list;
+    unsigned long long devMac = charsToui64(mac);
+
+    khint64_t locIt = kh_get(locM, locationMap, devMac);
+    if (locIt == kh_end(locationMap)) {   //list doesn't exist
+        list = malloc(sizeof(struct linkedList));
+        initList(list);
+    } else {
+        list = kh_value(locationMap, locIt);
+    }
+
+    return list;
+}
+
 /* Updates the position of the given device in the database.
  */
-void updatePositionDB(struct wisnPacket *packet, double x, double y) {
+void updatePositionDB(struct wisnPacket *packet, double x, double y, double radius) {
     bson_error_t error;
     char macString[13]; //MAC address is 2x6 hex chars + null terminator
 
@@ -918,7 +982,7 @@ void updatePositionDB(struct wisnPacket *packet, double x, double y) {
              packet->mac[4], packet->mac[5]);
 
     bson_t *query = BCON_NEW("mac", BCON_UTF8(macString));
-    bson_t *data = BCON_NEW("$set", "{", "x", BCON_DOUBLE(x), "y", BCON_DOUBLE(y), "}");
+    bson_t *data = BCON_NEW("$set", "{", "x", BCON_DOUBLE(x), "y", BCON_DOUBLE(y), "r", BCON_DOUBLE(radius), "}");
     if (!mongoc_collection_update(positionsCol, MONGOC_UPDATE_UPSERT, query, data, NULL, &error)) {
         printf("Error inserting position: %s\n", error.message);
     }
@@ -930,14 +994,14 @@ void updatePositionDB(struct wisnPacket *packet, double x, double y) {
 /* Turns the given packet into a JSON structure.
  */
 void JSONisePosition(struct wisnPacket *packet, double xPos, double yPos,
-                     char *buffer, int size) {
+                     double radius, char *buffer, int size) {
 
     memset(buffer, 0, size);
 
     snprintf(buffer, size,
-            "{\"mac\":\"%02X%02X%02X%02X%02X%02X\",\"x\":%f,\"y\":%f}",
+            "{\"mac\":\"%02X%02X%02X%02X%02X%02X\",\"x\":%f,\"y\":%f,\"r\":%f}",
             packet->mac[0], packet->mac[1], packet->mac[2], packet->mac[3],
-            packet->mac[4], packet->mac[5], xPos, yPos);
+            packet->mac[4], packet->mac[5], xPos, yPos, radius);
 }
 
 /* Updates the list of registered devices.
@@ -994,6 +1058,15 @@ void updateRegisteredUsers(void) {
                 destroyList(list, LIST_DELETE_DATA);
                 free(list);
                 kh_del(devM, deviceMap, it);
+
+                //Check previous location data too
+                khint64_t locIt = kh_get(locM, locationMap, kh_key(deviceMap, it));
+                if (locIt != kh_end(locationMap)) {   //There is data to delete
+                    list = kh_value(locationMap, locIt);
+                    destroyList(list, LIST_DELETE_DATA);
+                    free(list);
+                    kh_del(locM, locationMap, locIt);
+                }
             }
         }
     }
@@ -1013,4 +1086,42 @@ void updateRegisteredUsers(void) {
     }
 
     destroyList(&userList, LIST_DELETE_DATA);
+}
+
+/* Calculates the circular area all given locations fit inside.
+ */
+double calculateArea(struct linkedList *list, double *xPos, double *yPos) {
+    struct wisnLocation *location;
+    double minX = 256.0;
+    double minY = 256.0;
+    double maxX = 0.0;
+    double maxY = 0.0;
+    struct linkedNode *node = list->head;
+
+    while (node != NULL) {
+        location = node->data;
+
+        if (location->x > maxX) {
+            maxX = location->x;
+        }
+        if (location->x < minX) {
+            minX = location->x;
+        }
+        if (location->y > maxY) {
+            maxY = location->y;
+        }
+        if (location->x < minY) {
+            minY = location->y;
+        }
+
+        node = node->next;
+    }
+
+    //Update centre position
+    *xPos = minX + ((maxX - minX) / 2);
+    *yPos = minY + ((maxY - minY) / 2);
+    //Find which is larger to use as radius
+    maxX = max(maxX - minX, maxY - minY) / 2;
+    maxY = 1.5 * pointsPerMeter;
+    return max(maxX, maxY);
 }

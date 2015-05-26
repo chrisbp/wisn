@@ -16,7 +16,7 @@ var devices = {};     //Map of all device positions
 var socket;
 
 //Sets options for map
-var testMapOptions = {
+var wisnMapOptions = {
     //Tells gmaps which tiles to load
     getTileUrl: function(coord, zoom) {
         var maxNum = (1 << zoom);
@@ -27,13 +27,13 @@ var testMapOptions = {
         }
     },
     tileSize: new google.maps.Size(256, 256),
-    maxZoom: 3,
+    maxZoom: 5,
     minZoom: 0,
     name: "UQ Building 17 Floor 4"
 };
 
 //The type of map to be created
-var testMap = new google.maps.ImageMapType(testMapOptions);
+var wisnMap = new google.maps.ImageMapType(wisnMapOptions);
 
 //Function that creates the actual map
 function initialise() {
@@ -41,18 +41,35 @@ function initialise() {
     var latlong = new google.maps.LatLng(0, 0);
     var mapOptions = {
         center: latlong,
-        zoom: 1,
+        zoom: 3,
         streetViewControl: false,
         mapTypeControlOptions: {
-            mapTypeIds: ['test']
+            mapTypeIds: ['wisn']
         }
     };
 
     //Actual map object created here
     var map = new google.maps.Map(document.getElementById('map-canvas'),
         mapOptions);
-    map.mapTypes.set('test', testMap);
-    map.setMapTypeId('test');
+    map.mapTypes.set('wisn', wisnMap);
+    map.setMapTypeId('wisn');
+
+
+    //var allowedBounds = new google.maps.LatLngBounds(
+    //    map.getProjection().fromPointToLatLng(new google.maps.Point(0.0, 256.0)),
+    //    map.getProjection().fromPointToLatLng(new google.maps.Point(256.0, 0.0))
+    //);
+    //console.log("Allowed bounds are " + allowedBounds);
+
+    //var lastValidCenter = map.getCenter();
+
+    //google.maps.event.addListener(map, "center_changed", function() {
+    //    if (allowedBounds.contains(map.getCenter())) {
+    //        lastValidCenter = map.getCenter();
+    //        return;
+    //    }
+    //    map.panTo(lastValidCenter);
+    //});
 
     socket = io();
 
@@ -71,7 +88,7 @@ function initialise() {
 }
 
 //Create a new node marker on the map
-function addNode(map, latLng, name, nodeMenu, type) {
+function addNode(map, latLng, name, nodeMenu, type, devRad) {
     if (type == "node") {
         var wisnNode = nodes[name];
     } else if (type == "cal") {
@@ -81,7 +98,7 @@ function addNode(map, latLng, name, nodeMenu, type) {
     }
     var point = map.getProjection().fromLatLngToPoint(latLng);
     if (wisnNode != null) {
-        updateNodePosition(map, { name: name, x: point.x, y: point.y }, wisnNode, type);
+        updateNodePosition(map, { name: name, x: point.x, y: point.y, r: devRad }, wisnNode, type);
     } else {
         console.log("Added point " + name + " at X: " + point.x + "  Y: " + point.y);
         var wisnNode = new WisnNode();
@@ -116,7 +133,7 @@ function addNode(map, latLng, name, nodeMenu, type) {
                 position: latLng,
                 map: map,
                 title: name,
-                draggable: true
+                draggable: false
             });
             wisnNode.setMarker(marker);
             //Add new node to calibration map
@@ -149,6 +166,9 @@ function addNode(map, latLng, name, nodeMenu, type) {
                     socket.emit('repositionCal', { name: wisnNode.name, x: wisnNode.x, y: wisnNode.y});
                 }
             });
+        } else if (type == "device") {
+            wisnNode.r = devRad;
+            addCircle(wisnNode, map);
         }
     }
     return point;
@@ -169,6 +189,7 @@ function deleteNode(map, wisnNode) {
     } else if (wisnNode.type == "cal") {
         delete cals[wisnNode.name];
     } else if (wisnNode.type == "device") {
+        wisnNode.circle.setMap(null);
         delete devices[wisnNode.name];
     }
 }
@@ -208,14 +229,24 @@ function updateNodePosition(map, data, wisnNode, type) {
         wisnNode.setX(data.x);
         wisnNode.setY(data.y);
         updateInfoWindow(wisnNode);
+        if (wisnNode.type == "device") {
+            wisnNode.r = data.r;
+            wisnNode.circle.setMap(null);
+            delete wisnNode.circle;
+            addCircle(wisnNode, map);
+        }
     } else {
         console.log("Couldn't find a match for node to update");
     }
 }
 
 function updateInfoWindow(wisnNode) {
-    var content = '<div id="infoWindow"><h3>' + wisnNode.name + '</h3>' +
-                  '<h4>(' + wisnNode.x.toFixed(1) + ', ' + wisnNode.y.toFixed(1) + ')</h4></div>'
+    if (wisnNode.type == "device") {
+        var content = '<div id="infoWindow"><h3>' + wisnNode.name + '</h3></div>';
+    } else {
+        var content = '<div id="infoWindow"><h3>' + wisnNode.name + '</h3>' +
+                      '<h4>(' + wisnNode.x.toFixed(1) + ', ' + wisnNode.y.toFixed(1) + ')</h4></div>';
+    }
     wisnNode.infoWindow.setContent(content);
 }
 
@@ -336,7 +367,7 @@ function createNodeMenuListeners(map, nodeMenu) {
             var wisnNode = nodeMenu.getParentObj();
             if (wisnNode.type == "node") {
                 socket.emit('deleteNode', wisnNode.name);
-            } else if (wisnNide.type == "cal") {
+            } else if (wisnNode.type == "cal") {
                 socket.emit('deleteCal', wisnNode.name);
             }
             deleteNode(map, wisnNode);
@@ -384,10 +415,10 @@ function createSocketEventsEdit(map, nodeMenu) {
 function createSocketEventsView(map, nodeMenu) {
     //Add listeners for server
     socket.on('addDevice', function (data) {
-        console.log("Server: add device at (" + data.x + ", " + data.y + ")");
+        console.log("Server: add device at (" + data.x + ", " + data.y + ")" + " R " + data.r);
         var point = new google.maps.Point(data.x, data.y);
         var latLng = map.getProjection().fromPointToLatLng(point);
-        addNode(map, latLng, data.name, nodeMenu, "device");
+        addNode(map, latLng, data.name, nodeMenu, "device", data.r);
     });
 
     socket.on('deleteDevice', function (data) {
@@ -399,6 +430,31 @@ function createSocketEventsView(map, nodeMenu) {
         console.log("Server: repositioning device " + data.name);
         updateNodePositionByName(map, data, "device");
     });
+}
+
+function generateCircleArray(centerPoint, radius, projection) {
+    var circlePoints = [];
+    for (var i = 0; i < 360; i += 10) {
+        var x = centerPoint.x + radius * Math.cos(Math.PI * i / 180);
+        var y = centerPoint.y + radius * Math.sin(Math.PI * i / 180);
+        circlePoints.push(projection.fromPointToLatLng(new google.maps.Point(x, y)));
+    }
+    return circlePoints;
+}
+
+function addCircle(wisnNode, map) {
+    var point = new google.maps.Point(wisnNode.x, wisnNode.y);
+    var circle = new google.maps.Polygon({
+        strokeColor: '#FF0000',
+        strokeOpacity: 0.75,
+        strokeWeight: 1.5,
+        fillColor: '#FF0000',
+        fillOpacity: 0.25,
+        map: map,
+        paths: generateCircleArray(point, wisnNode.r, map.getProjection()),
+        geodesic: false
+    });
+    wisnNode.setCircle(circle);
 }
 
 google.maps.event.addDomListener(window, 'load', initialise);

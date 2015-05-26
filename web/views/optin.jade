@@ -3,26 +3,52 @@ html(lang="en")
     meta(charset="UTF-8")
     head
         title= title
+        style.
+            .errmsg {
+                color: #D8000C;
+                background-color: #FFBABA;
+            }
+            form {
+                display: table;
+            }
+            p {
+                display: table-row;
+            }
+            label {
+                display: table-cell;
+            }
+            input {
+                display: table-cell;
+            }
         script.
             var macRegex = /^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$/;
             function validateForm() {
+                var errors = "";
+                var errorDiv = document.getElementById("errors");
                 var fields = document.forms["optin"];
                 if (fields["name"].value == null || fields["name"].value == "") {
+                    errors += "Invalid name entered.<br>"
+                }
+                if (fields["mac"].value == null || !macRegex.test(fields["mac"].value)) {
+                    errors += "Invalid MAC address entered.";
+                }
+                errorDiv.innerHTML = errors;
+                if (errors == "") {
+                    return true;
+                } else {
                     return false;
                 }
-                if (fields["mac"].value != null && macRegex.test(fields["mac"].value)) {
-                    return true;
-                }
-                return false;
             }
     body
+        h1 Indoor Tracking Opt-In
         div
             form(name="optin", action="/optin", onsubmit="return validateForm()", method="post")
-                div
+                p
                     label(for="name") Name:
-                        input(id="name", type="text", value="", name="name")
-                div
+                    input(id="name", type="text", value="", name="name")
+                p
                     label(for="mac") MAC Address:
-                        input(id="mac", type="text", value="", name="mac")
-                div
+                    input(id="mac", type="text", value="", name="mac")
+                p
                     input(type="submit", value="Opt-in")
+        #errors.errmsg

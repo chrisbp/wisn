@@ -3,20 +3,46 @@ html(lang="en")
     meta(charset="UTF-8")
     head
         title= title
+        style.
+            .errmsg {
+                color: #D8000C;
+                background-color: #FFBABA;
+            }
+            form {
+                display: table;
+            }   
+            p { 
+                display: table-row;
+            }   
+            label {
+                display: table-cell;
+            }   
+            input {
+                display: table-cell;
+            }
         script.
             var macRegex = /^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$/;
             function validateForm() {
-                var fields = document.forms["optin"];
-                if (fields["mac"].value != null && macRegex.test(fields["mac"].value)) {
-                    return true;
+                var errors = ""; 
+                var errorDiv = document.getElementById("errors");
+                var fields = document.forms["optout"];
+                if (fields["mac"].value == null || !macRegex.test(fields["mac"].value)) {
+                    errors += "Invalid MAC address entered.";
                 }
-                return false;
+                errorDiv.innerHTML = errors;
+                if (errors == "") {
+                    return true;
+                } else {
+                    return false;
+                }   
             }
     body
+        h1 Indoor Tracking Opt-Out
         div
             form(name="optout", action="/optout", onsubmit="return validateForm()", method="post")
-                div
+                p
                     label(for="mac") MAC Address:
-                        input(id="mac", type="text", value="", name="mac")
-                div
+                    input(id="mac", type="text", value="", name="mac")
+                p
                     input(type="submit", value="Opt-out")
+        #errors.errmsg
