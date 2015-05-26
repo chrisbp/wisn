@@ -417,15 +417,6 @@ void readPacket(u_char *args, const struct pcap_pkthdr *header,
         }
         wisnData->rssi /= (double)list->size;
 
-        //Check if the newest RSSI reading is an outlier and remove if so
-        nodePacket = list->tail->data;
-        if (nodePacket->rssi > 2 * wisnData->rssi || nodePacket->rssi < 0.5 * wisnData->rssi) {
-            printf("OUTLIER FOUND! - %f\n", nodePacket->rssi);
-            removeNode(list, list->tail, LIST_NO_LOCK, LIST_DELETE_DATA);
-            free(wisnData);
-            return;
-        }
-
         memset(buff, 0, ARRAY_SIZE(buff));
         tmInfo = localtime(&now);
         strftime(buff, ARRAY_SIZE(buff), "%X", tmInfo);
