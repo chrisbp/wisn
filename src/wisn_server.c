@@ -152,8 +152,8 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Error releasing list mutex.\n");
         }
 
-        printf("Packet: ");
-        printPacket(packet);
+        //printf("Packet: ");
+        //printPacket(packet);
         list = storeWisnPacket(packet); //Store the packet and get the list of packets for this device
         if (list != NULL) {
             locList = getLocationList(packet->mac); //Get the list of locations last calculated
@@ -532,8 +532,8 @@ void removeOldData(struct linkedList *deviceList) {
  * Returns a distance scaled by calibration value.
  */
 double getDistance(double rssi) {
-    double PLZero = 20.0;
-    double loss = 4.0;
+    double PLZero = 18.0;
+    double loss = 2.5;
     return pow(10, (rssi - PLZero) / (10 * loss)) * pointsPerMeter;
 }
 
@@ -958,12 +958,15 @@ struct linkedList *storeWisnPacket(struct wisnPacket *packet) {
  */
 struct linkedList *getLocationList(unsigned char *mac) {
     struct linkedList *list;
+    int ret;
     unsigned long long devMac = charsToui64(mac);
 
     khint64_t locIt = kh_get(locM, locationMap, devMac);
     if (locIt == kh_end(locationMap)) {   //list doesn't exist
         list = malloc(sizeof(struct linkedList));
         initList(list);
+        locIt = kh_put(locM, locationMap, devMac, &ret);
+        kh_value(locationMap, locIt) = list;
     } else {
         list = kh_value(locationMap, locIt);
     }
@@ -1122,6 +1125,6 @@ double calculateArea(struct linkedList *list, double *xPos, double *yPos) {
     *yPos = minY + ((maxY - minY) / 2);
     //Find which is larger to use as radius
     maxX = max(maxX - minX, maxY - minY) / 2;
-    maxY = 1.5 * pointsPerMeter;
-    return max(maxX, maxY);
+    maxY = 2.2 * pointsPerMeter;
+    return maxX + maxY;
 }

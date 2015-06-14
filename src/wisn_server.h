@@ -42,7 +42,7 @@
 #define DB_COL_POSITIONS "positions"
 #define DB_COL_CALIBRATION "calibration"
 #define DB_COL_REGISTERED "names"
-#define LOC_NUM_AVG 8
+#define LOC_NUM_AVG 32
 
 enum argState {ARG_NONE, ARG_BROKER, ARG_PORT};
 enum parseState {PARSE_NODENUM, PARSE_TIME, PARSE_MAC, PARSE_RSSI, PARSE_NAME,

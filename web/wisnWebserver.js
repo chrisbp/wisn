@@ -54,7 +54,7 @@ app.locals.pretty = true;
 app.use(express.static(__dirname + "/images"));
 
 app.get("/", function (req, res) {
-    res.render("map", { title: "Map Test",
+    res.render("map", { title: "Wisn Map",
                         scripts: ["https://maps.googleapis.com/maps/api/js?v=3",
                                   "/socket.io/socket.io.js",
                                   "wisnNode.js",
@@ -63,7 +63,7 @@ app.get("/", function (req, res) {
 });
 
 app.get("/edit", function (req, res) {
-    res.render("map", { title: "Edit Map Test",
+    res.render("map", { title: "Edit Wisn Map",
                         scripts: ["https://maps.googleapis.com/maps/api/js?v=3",
                                   "/socket.io/socket.io.js",
                                   "wisnNode.js",
